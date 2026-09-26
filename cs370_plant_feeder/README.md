@@ -26,6 +26,7 @@ The project uses the following hardware:
 * Resistors and diodes
 * TIP120 transistors
 * Two solenoid valves
+* ADC for the soil moisture sensor (ADS1115 or MCP3008), still to be ordered
 
 The Raspberry Pi 5 is the primary computing platform for the project. The ELEGOO UNO Super Starter Kit provides additional electronic components for development, prototyping, and testing. The Arduino Uno is not intended to replace the Raspberry Pi as the primary project platform.
 

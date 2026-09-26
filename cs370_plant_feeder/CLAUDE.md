@@ -19,6 +19,10 @@ The system will use a capacitive soil moisture sensor to monitor soil conditions
 * Diodes and resistors
 * Breadboards, jumper wires, and connectors
 
+Still needed: an ADC for the capacitive soil moisture sensor (analog output). The Pi 5 has no analog inputs; an ADS1115 (I2C) or MCP3008 (SPI) is the expected choice. Do not write driver code for a specific ADC until the part is on the bench.
+
+Electrical notes: Pi GPIO is 3.3 V and not 5 V tolerant. Wire with power off. Pump and valve loads are switched through TIP120s or the relay with flyback diodes, never driven from a GPIO pin directly.
+
 The Raspberry Pi 5 is the primary computing platform. Components from the ELEGOO UNO Super Starter Kit may be used for development, prototyping, and supporting electronics as needed.
 
 ## Hard constraints
@@ -29,6 +33,9 @@ The Raspberry Pi 5 is the primary computing platform. Components from the ELEGOO
 * The soil moisture sensor and reservoir float switch must both contribute to watering decisions.
 * Do not reduce the project to a single soil moisture threshold that directly turns on the pump.
 * The shipped product must not depend on an LLM or hosted or pretrained model.
+* The product makes no network calls except serving its own LAN interface, and must keep watering correctly with the network unplugged.
+* Every daemon must be supervisable: clean exit codes, no orphaned file descriptors across restarts, and a heartbeat the supervisor can check.
+* If the controller or actuator process dies or hangs, the actuator output must end up OFF. Water must never be left running because a process crashed.
 * Hardware failures and system call failures must have explicit error handling where applicable.
 * When the software cannot establish that watering is safe, the pump and valve should default to OFF.
 * Never invent measurements, passing tests, hardware behavior, transcripts, commits, or completed features.
@@ -54,7 +61,9 @@ After watering, later soil moisture observations can be compared with the condit
 * Keep hardware specific pin numbers, thresholds, timing values, and calibration values centralized rather than scattered through the code.
 * Do not claim a threshold, timing value, or calibration constant is correct until it has been measured on the actual hardware.
 * Do not claim a feature or failure recovery behavior works until it has been tested.
-* Preserve genuine raw Claude Code `.jsonl` sessions when they exist. Never fabricate a transcript.
+* Preserve genuine raw Claude Code `.jsonl` sessions when they exist. Never fabricate a transcript. Each partner copies their own sessions into `transcripts/<name>/` at every milestone.
+* Multi file or algorithmic changes: plan first and wait for approval.
+* Commit only from a green state. Message format: `M<n>: <what>`.
 
 ## Build and test
 
@@ -67,6 +76,6 @@ Do not invent build or test commands for functionality that has not yet been imp
 * Student 1: Samuel Berman
 * Student 2: Jim Guadagnoli
 
-Specific implementation ownership will be divided as development begins.
+Specific implementation ownership will be divided as development begins. Until then, the agent edits outside the current session owner's area only when told explicitly.
 
 Both partners should understand the integrated system and review work across the ownership boundary.
