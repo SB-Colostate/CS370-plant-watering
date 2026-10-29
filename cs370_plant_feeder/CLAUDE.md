@@ -25,6 +25,10 @@ Electrical notes: Pi GPIO is 3.3 V and not 5 V tolerant. Wire with power off. Pu
 
 The Raspberry Pi 5 is the primary computing platform. Components from the ELEGOO UNO Super Starter Kit may be used for development, prototyping, and supporting electronics as needed.
 
+## Hardware changes since M1
+
+See `DESIGN.md` §10. Current build: Raspberry Pi 3 (budget), the kit's resistive soil probe read through the Arduino Uno as a USB ADC (until an ADS1115/MCP3008 is ordered or the TA rules on the Uno), and an HC-SR04 ultrasonic gauge for reservoir level in place of the float switch. The HC-SR04 echo pin needs a 1k/2k divider on the Pi. The pump is on order; until it arrives, watering is simulated and must be labeled as simulated.
+
 ## Hard constraints
 
 * The Raspberry Pi 5 is the primary project platform.
@@ -38,6 +42,7 @@ The Raspberry Pi 5 is the primary computing platform. Components from the ELEGOO
 * If the controller or actuator process dies or hangs, the actuator output must end up OFF. Water must never be left running because a process crashed.
 * Hardware failures and system call failures must have explicit error handling where applicable.
 * When the software cannot establish that watering is safe, the pump and valve should default to OFF.
+* Pump runs are hard-capped at 10 minutes (controller timer, with the supervisor as an independent backstop). Never remove or raise the cap without both partners agreeing; tests may lower it but must say so.
 * Never invent measurements, passing tests, hardware behavior, transcripts, commits, or completed features.
 
 ## Current architecture direction

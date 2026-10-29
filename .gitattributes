@@ -1,0 +1,4 @@
+# Transcripts must be committed byte-for-byte as Claude Code wrote them
+*.jsonl -text
+# Binary assets
+*.png binary
