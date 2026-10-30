@@ -20,8 +20,10 @@ VALGRIND    = valgrind --quiet --error-exitcode=99 --leak-check=full --errors-fo
 # Prefix for running each test binary; `make asan` sets it to $(VALGRIND).
 RUNNER ?=
 
+STORE_OBJS = $(OBJ)/src/store/record.o
+
 PROGS =
-TESTS = $(BIN)/test_smoke
+TESTS = $(BIN)/test_smoke $(BIN)/test_record
 
 .PHONY: all test asan clean
 
@@ -32,9 +34,13 @@ $(OBJ)/%.o: %.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BIN)/test_smoke: $(OBJ)/tests/test_smoke.o
+# Every binary links its listed objects; each one just declares its prerequisites below.
+$(BIN)/%:
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $^ -o $@
+
+$(BIN)/test_smoke:  $(OBJ)/tests/test_smoke.o
+$(BIN)/test_record: $(OBJ)/tests/test_record.o $(STORE_OBJS)
 
 test: all $(TESTS)
 	@for t in $(TESTS); do echo "== $(RUNNER) $$t"; $(RUNNER) $$t || exit 1; done
