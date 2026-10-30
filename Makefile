@@ -23,10 +23,10 @@ RUNNER ?=
 COMMON_OBJS = $(OBJ)/src/common/paths.o
 STORE_OBJS  = $(OBJ)/src/store/record.o $(OBJ)/src/store/store.o
 
-PROGS   = $(BIN)/plantctl
-TESTS   = $(BIN)/test_smoke $(BIN)/test_record $(BIN)/test_store
+PROGS   = $(BIN)/plantctl $(BIN)/sampler $(BIN)/hub
+TESTS   = $(BIN)/test_smoke $(BIN)/test_record $(BIN)/test_store $(BIN)/test_parse
 HELPERS = $(BIN)/mklog
-SCRIPTS = tests/it_plantctl.sh
+SCRIPTS = tests/it_plantctl.sh tests/it_pipeline.sh
 
 .PHONY: all test asan clean
 
@@ -47,6 +47,9 @@ $(BIN)/test_record: $(OBJ)/tests/test_record.o $(STORE_OBJS)
 $(BIN)/test_store:  $(OBJ)/tests/test_store.o $(STORE_OBJS)
 $(BIN)/mklog:       $(OBJ)/tests/mklog.o $(STORE_OBJS)
 $(BIN)/plantctl:    $(OBJ)/src/plantctl/plantctl.o $(STORE_OBJS) $(COMMON_OBJS)
+$(BIN)/sampler:     $(OBJ)/src/sampler/sampler.o $(OBJ)/src/sampler/parse.o $(COMMON_OBJS)
+$(BIN)/hub:         $(OBJ)/src/hub/hub.o $(STORE_OBJS) $(COMMON_OBJS)
+$(BIN)/test_parse:  $(OBJ)/tests/test_parse.o $(OBJ)/src/sampler/parse.o
 
 test: all $(TESTS) $(HELPERS)
 	@for t in $(TESTS); do echo "== $(RUNNER) $$t"; $(RUNNER) $$t || exit 1; done

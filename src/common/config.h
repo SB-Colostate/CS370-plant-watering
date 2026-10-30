@@ -10,6 +10,8 @@
 
 /* Sampler: exit (code 3) if no valid frame arrives for this long. Uno sends ~1 line / 1.1 s. */
 #define CFG_FRAME_TIMEOUT_MS 5000
+/* Opening the port resets the Uno (~2 s boot) and the first line is discarded. UNMEASURED. */
+#define CFG_FIRST_FRAME_TIMEOUT_MS 10000
 
 /* Storage (mechanism D). DESIGN §4: fsync every 10 s or 50 records. UNMEASURED. */
 #define CFG_DATA_DIR_DEFAULT "plant-data"   /* relative to $HOME */
