@@ -1,7 +1,8 @@
 # M3 demo: both sensors responding, end to end through the C pipeline into plant.plog.
 # Commit 55b55db on the Pi 3. Captured verbatim from the Claude Code session.
 # Command: hub & ; timeout -s TERM 45 sampler; pkill -TERM -x hub; plantctl tail 90; plantctl status
-# During the run Jim touched the soil probe (~19:36:39-56) and moved a hand over the HC-SR04.
+# Before the run Jim was asked to touch/wet the soil probe and move a hand over the HC-SR04.
+# What was physically done was not recorded by the software; the readings below are consistent with it.
 # Soil 0 -> 60..97 raw while touched, back to 0. Level 16.8 cm -> 1.7..12 cm with the hand, back to 16.2 cm.
 # Two single-sample outliers (212.6 cm seq 115, 245.3 cm seq 155) while the hand entered/left:
 # stray echoes not caught by the Uno's median-of-5; stored as received (filtering is hub work, post-M3).
