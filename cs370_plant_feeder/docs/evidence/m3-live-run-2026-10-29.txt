@@ -1,0 +1,50 @@
+# M3 live run: real Uno (soil probe + HC-SR04) -> sampler -> hub.sock -> plant.plog
+# Commit c869ee3 on the Pi 3. Captured verbatim from the Claude Code session.
+# Command (run over ssh from the dev PC):
+#   build/bin/hub & sleep 1; timeout -s TERM 30 build/bin/sampler; pkill -TERM -x hub;
+#   build/bin/plantctl tail 20; build/bin/plantctl status; ls -l ~/plant-data
+# Not shown by this run: the values were constant (soil 0 raw, level 16.5 cm) and nothing
+# was moved during it, so this proves the data path, not that readings track the plant.
+
+Thu 29 Oct 19:32:12 MDT 2026
+hub: log /home/jimmy/plant-data/plant.plog: 0 valid records, dropped 0 bytes (new file); next seq 1
+sampler: pid 2364 reading /dev/serial/by-id/usb-Arduino__www.arduino.cc__0043_43439343134351905243-if00
+sampler: bad frame #1: ""
+sampler: bad frame #2: ""
+sampler: bad frame #3: "SOOK0,DIST,16.5"
+sampler: bad frame #4: "SOIL,0,DIST,I�I5"
+sampler: exit 0 (sent=78 send_drops=0 bad_frames=4)
+sampler rc=124
+hub: exit 0 (received=78 rejected=0 syncs=4 max_sync_us=3741)
+     seq  wall                       mono_s  sensor  value
+      60  2026-10-29 19:32:33      3854.266  soil    0 raw
+      61  2026-10-29 19:32:33      3854.266  level   16.5 cm
+      62  2026-10-29 19:32:34      3855.328  soil    0 raw
+      63  2026-10-29 19:32:34      3855.328  level   16.5 cm
+      64  2026-10-29 19:32:35      3856.389  soil    0 raw
+      65  2026-10-29 19:32:35      3856.389  level   16.5 cm
+      66  2026-10-29 19:32:36      3857.449  soil    0 raw
+      67  2026-10-29 19:32:36      3857.449  level   16.5 cm
+      68  2026-10-29 19:32:37      3858.510  soil    0 raw
+      69  2026-10-29 19:32:37      3858.510  level   16.5 cm
+      70  2026-10-29 19:32:38      3859.571  soil    0 raw
+      71  2026-10-29 19:32:38      3859.571  level   16.5 cm
+      72  2026-10-29 19:32:39      3860.635  soil    0 raw
+      73  2026-10-29 19:32:39      3860.635  level   16.5 cm
+      74  2026-10-29 19:32:40      3861.697  soil    0 raw
+      75  2026-10-29 19:32:40      3861.697  level   16.5 cm
+      76  2026-10-29 19:32:41      3862.757  soil    0 raw
+      77  2026-10-29 19:32:41      3862.757  level   16.5 cm
+      78  2026-10-29 19:32:42      3863.818  soil    0 raw
+      79  2026-10-29 19:32:42      3863.818  level   16.5 cm
+---
+data dir:   /home/jimmy/plant-data
+writer:     none (no hub holds LOCK)
+records:    80 (last seq 79)
+soil:       0 raw          seq 78       age 1.5 s
+level:      16.5 cm        seq 79       age 1.5 s
+last START: seq 0 at 2026-10-29 19:32:12
+last RECOVERED: none
+total 4
+-rw-r--r-- 1 jimmy jimmy    0 Oct 29 19:32 LOCK
+-rw-r--r-- 1 jimmy jimmy 2560 Oct 29 19:32 plant.plog

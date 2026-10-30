@@ -20,7 +20,8 @@ done
 
 mkfifo "$d/uno"
 exec 3<>"$d/uno"        # hold a writer open so the sampler doesn't see EOF yet
-$RUNNER "$BIN/sampler" -D "$d/uno" -d "$d" 2>"$d/sampler.err" &
+# 3>&-: the sampler must not inherit our write end, or it would never see EOF.
+$RUNNER "$BIN/sampler" -D "$d/uno" -d "$d" 2>"$d/sampler.err" 3>&- &
 sampler_pid=$!
 sleep 1
 
@@ -42,6 +43,7 @@ cat "$d/sampler.err" "$d/hub.err"
 [ $hrc -eq 0 ] || fail "hub exit $hrc on SIGTERM, want 0"
 [ ! -e "$d/hub.sock" ] || fail "hub left its socket behind"
 grep -q 'bad_frames=1' "$d/sampler.err" || fail "bad frame not counted"
+grep -q 'EOF on' "$d/sampler.err" || fail "sampler exited 3 but not via the EOF path"
 
 out=$($RUNNER "$BIN/plantctl" -d "$d" tail 100)
 echo "$out"
