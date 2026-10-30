@@ -20,10 +20,13 @@ VALGRIND    = valgrind --quiet --error-exitcode=99 --leak-check=full --errors-fo
 # Prefix for running each test binary; `make asan` sets it to $(VALGRIND).
 RUNNER ?=
 
-STORE_OBJS = $(OBJ)/src/store/record.o $(OBJ)/src/store/store.o
+COMMON_OBJS = $(OBJ)/src/common/paths.o
+STORE_OBJS  = $(OBJ)/src/store/record.o $(OBJ)/src/store/store.o
 
-PROGS =
-TESTS = $(BIN)/test_smoke $(BIN)/test_record $(BIN)/test_store
+PROGS   = $(BIN)/plantctl
+TESTS   = $(BIN)/test_smoke $(BIN)/test_record $(BIN)/test_store
+HELPERS = $(BIN)/mklog
+SCRIPTS = tests/it_plantctl.sh
 
 .PHONY: all test asan clean
 
@@ -42,9 +45,12 @@ $(BIN)/%:
 $(BIN)/test_smoke:  $(OBJ)/tests/test_smoke.o
 $(BIN)/test_record: $(OBJ)/tests/test_record.o $(STORE_OBJS)
 $(BIN)/test_store:  $(OBJ)/tests/test_store.o $(STORE_OBJS)
+$(BIN)/mklog:       $(OBJ)/tests/mklog.o $(STORE_OBJS)
+$(BIN)/plantctl:    $(OBJ)/src/plantctl/plantctl.o $(STORE_OBJS) $(COMMON_OBJS)
 
-test: all $(TESTS)
+test: all $(TESTS) $(HELPERS)
 	@for t in $(TESTS); do echo "== $(RUNNER) $$t"; $(RUNNER) $$t || exit 1; done
+	@for s in $(SCRIPTS); do echo "== $$s"; BIN=$(BIN) RUNNER="$(RUNNER)" sh $$s || exit 1; done
 	@echo "ALL TESTS PASSED ($(BUILD))"
 
 asan:

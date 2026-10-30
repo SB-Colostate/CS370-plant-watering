@@ -259,6 +259,7 @@ int store_reader_open(struct store_reader *rd, const char *dir)
     char path[PATH_MAX];
     rd->fd = -1;
     rd->count = 0;
+    rd->file_size = 0;
     if (join(path, sizeof path, dir, CFG_LOG_FILE) < 0)
         return EXIT_USAGE;
     rd->fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -266,8 +267,7 @@ int store_reader_open(struct store_reader *rd, const char *dir)
         fprintf(stderr, "store: open %s: %s\n", path, strerror(errno));
         return EXIT_SYSERR;
     }
-    off_t size;
-    if (scan_valid(rd->fd, &rd->count, &size) < 0) {
+    if (scan_valid(rd->fd, &rd->count, &rd->file_size) < 0) {
         fprintf(stderr, "store: scan %s: %s\n", path, strerror(errno));
         store_reader_close(rd);
         return EXIT_SYSERR;

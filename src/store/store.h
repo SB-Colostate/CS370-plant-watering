@@ -60,6 +60,7 @@ int store_close(struct store *s);
 struct store_reader {
     int fd;
     uint32_t count;
+    off_t file_size; /* > count * REC_SIZE means a torn tail the writer will cut on next open */
 };
 
 int store_reader_open(struct store_reader *rd, const char *dir);

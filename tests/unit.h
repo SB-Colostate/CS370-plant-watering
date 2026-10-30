@@ -20,6 +20,7 @@ static int unit_fails;
 #define RUN(fn)                          \
     do {                                 \
         printf("  %s\n", #fn);           \
+        fflush(stdout);                  \
         fn();                            \
     } while (0)
 
