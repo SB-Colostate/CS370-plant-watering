@@ -32,7 +32,7 @@ The users are us (see `PROBLEM.md`): Sam, with potted plants at home in Florida 
 | hub → pump relay | event-driven; ≤ 1 watering/hour; **hard cap 10 min per run** | see §3 |
 | supervisor heartbeat → log | 1/min (soak spec requires ≥ 1/hr) | liveness, RSS, counts |
 
-**Wiring for M3:** the HC-SR04 moves from the Uno (where it was for the M2 bring-up) to Pi GPIO23/24, with the echo going through a 1 kΩ/2 kΩ divider, so ranging is timed on the Pi. The Uno remains only as the soil ADC (§10).
+**Wiring for M3 (as built):** both sensors stay on the Uno, which sends one line per ~1.1 s, `SOIL,<0-1023>,DIST,<cm>`, over `/dev/ttyACM0`. One `sampler` process reads it and sends one datagram per reading to the hub. Moving the HC-SR04 to Pi GPIO23/24 (1 kΩ/2 kΩ echo divider, its own sampler) is deferred past M3. If it moves, the second sampler plugs into the same socket and message format.
 
 ---
 
@@ -41,13 +41,13 @@ The users are us (see `PROBLEM.md`): Sam, with potted plants at home in Florida 
 We implement **D** and **E** from the Section 3.2 menu. A stretch goal is **C**.
 
 ### D — Custom storage layer: crash-consistent append-only log
-- **Component:** `src/store/`. Fixed-size binary records `{magic, seq, mono_ns, wall_s, sensor_id, value, flags, crc32}` appended to daily segment files.
+- **Component:** `src/store/`. Fixed-size 32-byte binary records `{magic, sensor_id, flags, seq, mono_ns, wall_s, value, crc32}` (layout in `src/store/record.h`) appended to one log file, `plant.plog`. Record *i* has seq *i*. M3 uses a single file, not daily segments: the Pi 3 has no RTC, so wall-clock dates can't name or order files. Segment rolling by seq is post-M3.
 - **Why the user needs it:** after a power blip on an unattended SD card, the system must still know **when it last watered**. Otherwise it may water twice, and overwatering kills plants faster than drought. Decisions also depend on history (drying rate, the last result).
-- **Crash story:** on startup, the first record with a bad magic or CRC marks a torn write; the log is truncated there. A watering **intent** record is fsynced *before* the relay switches on; an intent with no completion record forces a lockout instead of a second watering.
+- **Crash story:** on startup, the first record with a bad magic, a bad CRC, or a seq that isn't its index marks a torn write. The log is truncated there and a durable `RECOVERED` event records the bytes dropped. A watering **intent** record is fsynced *before* the relay switches on; an intent with no completion record forces a lockout instead of a second watering.
 - **Measured by:** batching vs. fsync cost; recovery after power pulls mid-write (§6).
 
 ### E — Multi-process architecture with a supervisor
-- **Component:** `src/supervisor/`, `src/sampler_soil/`, `src/sampler_level/`, `src/hub/`. Samplers send data to the hub over Unix domain datagram sockets.
+- **Component:** `src/supervisor/` (not yet implemented at M3), `src/sampler/` (one process for both Uno sensors at M3), `src/hub/`. The sampler sends data to the hub over a Unix domain datagram socket (`struct plant_msg` in `src/common/msg.h`).
 - **Why the user needs it:** the likely failures are hardware: the USB-serial link resets, a probe gets knocked out, a jumper works loose. A hung serial read must not freeze the pump logic. One process per sensor means a dead sensor costs only its own data: the hub marks it STALE and **stops watering** instead of guessing. Restarts back off exponentially (1 s → 60 s) so an unplugged sensor can't cause a restart storm.
 - **Measured by:** `kill -9` and unplug trials: detection latency, recovery time, samples lost (§6).
 
@@ -150,16 +150,19 @@ Thresholds are tuned on episodes we **provoke on purpose**: dry pot, tube pulled
 
 ---
 
-## 8. Ownership map  **[TEAM — proposed split, confirm with Sam]**
+## 8. Ownership map  **[TEAM — confirm with Sam]**
 
-| Area | Owner | Notes |
-|---|---|---|
-| Hardware, wiring, Uno firmware (`arduino/`) | Jim | in-person; owns all physical integration |
-| Samplers: `src/sampler_soil`, `src/sampler_level` | Jim | serial tty + GPIO timing |
-| Supervisor (mechanism E): `src/supervisor` | Jim | crash/unplug testing is physical |
-| Storage layer (mechanism D): `src/store` | Sam | testable without hardware (replay) |
-| Analysis engine / state machine: `src/hub` | Sam | runs against replayed logs |
-| CLI `plantctl`, evaluation scripts | Shared | |
+Updated at M3 to show who actually wrote each part. The M2 proposal had Sam on `src/store` and `src/hub`. For M3 they were written in Jim's Claude Code sessions, on Jim's instruction, and Sam reviews them.
+
+| Area | Written by (M3) | Status | Notes |
+|---|---|---|---|
+| Hardware, wiring, Uno firmware (`arduino/`) | Jim | done (M2) | in-person; owns all physical integration |
+| Sampler: `src/sampler` (both Uno sensors) | Jim (with Claude Code) | M3 | serial tty |
+| Storage layer (mechanism D): `src/store` | Jim (with Claude Code); Sam reviews | M3 | originally proposed for Sam |
+| Hub: `src/hub` (receive + store only; no state machine yet) | Jim (with Claude Code); Sam reviews | M3 | analysis engine still proposed for Sam |
+| CLI `plantctl` | Jim (with Claude Code) | M3 | read-only |
+| Supervisor (mechanism E): `src/supervisor` | — | not started | proposed: Jim |
+| Evaluation scripts | — | not started | shared |
 
 The non-owner reviews every diff.
 

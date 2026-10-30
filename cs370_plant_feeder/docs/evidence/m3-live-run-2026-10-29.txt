@@ -48,3 +48,20 @@ last RECOVERED: none
 total 4
 -rw-r--r-- 1 jimmy jimmy    0 Oct 29 19:32 LOCK
 -rw-r--r-- 1 jimmy jimmy 2560 Oct 29 19:32 plant.plog
+
+# Recovery demo, 19:33 MDT. SIMULATED torn tail (13 bytes appended by hand), not a power cut.
+#   printf "TORN-WRITE-13" >> ~/plant-data/plant.plog; build/bin/hub &; ...; pkill -TERM -x hub
+#   build/bin/plantctl tail 8
+# (Two grep/cd commands in that ssh line misfired in PowerShell quoting and are omitted;
+#  the sampler did not run in this pass.)
+hub: log /home/jimmy/plant-data/plant.plog: 80 valid records, dropped 13 bytes; next seq 82
+hub: exit 0 (received=0 rejected=0 syncs=2 max_sync_us=2017)
+     seq  wall                       mono_s  sensor  value
+      74  2026-10-29 19:32:40      3861.697  soil    0 raw
+      75  2026-10-29 19:32:40      3861.697  level   16.5 cm
+      76  2026-10-29 19:32:41      3862.757  soil    0 raw
+      77  2026-10-29 19:32:41      3862.757  level   16.5 cm
+      78  2026-10-29 19:32:42      3863.818  soil    0 raw
+      79  2026-10-29 19:32:42      3863.818  level   16.5 cm
+      80  2026-10-29 19:33:39      3920.404  system  RECOVERED dropped=13B
+      81  2026-10-29 19:33:39      3920.406  system  START
