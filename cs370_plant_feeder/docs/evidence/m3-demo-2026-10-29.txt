@@ -1,0 +1,114 @@
+# M3 demo: both sensors responding, end to end through the C pipeline into plant.plog.
+# Commit 55b55db on the Pi 3. Captured verbatim from the Claude Code session.
+# Command: hub & ; timeout -s TERM 45 sampler; pkill -TERM -x hub; plantctl tail 90; plantctl status
+# Before the run Jim was asked to touch/wet the soil probe and move a hand over the HC-SR04.
+# What was physically done was not recorded by the software; the readings below are consistent with it.
+# Soil 0 -> 60..97 raw while touched, back to 0. Level 16.8 cm -> 1.7..12 cm with the hand, back to 16.2 cm.
+# Two single-sample outliers (212.6 cm seq 115, 245.3 cm seq 155) while the hand entered/left:
+# stray echoes not caught by the Uno's median-of-5; stored as received (filtering is hub work, post-M3).
+
+Thu 29 Oct 19:36:23 MDT 2026
+hub: log /home/jimmy/plant-data/plant.plog: 82 valid records, dropped 0 bytes; next seq 83
+sampler: pid 2684 reading /dev/serial/by-id/usb-Arduino__www.arduino.cc__0043_43439343134351905243-if00
+sampler: exit 0 (sent=86 send_drops=0 bad_frames=0)
+hub: exit 0 (received=86 rejected=0 syncs=6 max_sync_us=6626)
+Thu 29 Oct 19:37:10 MDT 2026
+     seq  wall                       mono_s  sensor  value
+      80  2026-10-29 19:33:39      3920.404  system  RECOVERED dropped=13B
+      81  2026-10-29 19:33:39      3920.406  system  START
+      82  2026-10-29 19:36:23      4084.135  system  START
+      83  2026-10-29 19:36:24      4085.142  system  SAMPLER_RESTART pid=2684
+      84  2026-10-29 19:36:24      4085.142  soil    0 raw
+      85  2026-10-29 19:36:24      4085.142  level   16.8 cm
+      86  2026-10-29 19:36:25      4086.102  soil    0 raw
+      87  2026-10-29 19:36:25      4086.102  level   16.8 cm
+      88  2026-10-29 19:36:26      4087.162  soil    0 raw
+      89  2026-10-29 19:36:26      4087.162  level   16.8 cm
+      90  2026-10-29 19:36:27      4088.224  soil    0 raw
+      91  2026-10-29 19:36:27      4088.224  level   16.8 cm
+      92  2026-10-29 19:36:28      4089.289  soil    0 raw
+      93  2026-10-29 19:36:28      4089.289  level   16.8 cm
+      94  2026-10-29 19:36:29      4090.349  soil    0 raw
+      95  2026-10-29 19:36:29      4090.349  level   16.8 cm
+      96  2026-10-29 19:36:30      4091.410  soil    0 raw
+      97  2026-10-29 19:36:30      4091.410  level   16.8 cm
+      98  2026-10-29 19:36:31      4092.470  soil    0 raw
+      99  2026-10-29 19:36:31      4092.470  level   16.8 cm
+     100  2026-10-29 19:36:32      4093.532  soil    0 raw
+     101  2026-10-29 19:36:32      4093.532  level   16.8 cm
+     102  2026-10-29 19:36:33      4094.605  soil    0 raw
+     103  2026-10-29 19:36:33      4094.605  level   16.8 cm
+     104  2026-10-29 19:36:34      4095.665  soil    0 raw
+     105  2026-10-29 19:36:34      4095.665  level   16.8 cm
+     106  2026-10-29 19:36:35      4096.726  soil    0 raw
+     107  2026-10-29 19:36:35      4096.726  level   16.8 cm
+     108  2026-10-29 19:36:36      4097.788  soil    0 raw
+     109  2026-10-29 19:36:36      4097.788  level   16.8 cm
+     110  2026-10-29 19:36:37      4098.860  soil    0 raw
+     111  2026-10-29 19:36:37      4098.860  level   16.8 cm
+     112  2026-10-29 19:36:39      4099.938  soil    60 raw
+     113  2026-10-29 19:36:39      4099.938  level   16.8 cm
+     114  2026-10-29 19:36:40      4101.030  soil    83 raw
+     115  2026-10-29 19:36:40      4101.030  level   212.6 cm
+     116  2026-10-29 19:36:41      4102.092  soil    97 raw
+     117  2026-10-29 19:36:41      4102.092  level   16.8 cm
+     118  2026-10-29 19:36:42      4103.177  soil    83 raw
+     119  2026-10-29 19:36:42      4103.177  level   5.2 cm
+     120  2026-10-29 19:36:43      4104.234  soil    72 raw
+     121  2026-10-29 19:36:43      4104.234  level   3.9 cm
+     122  2026-10-29 19:36:44      4105.290  soil    83 raw
+     123  2026-10-29 19:36:44      4105.290  level   1.7 cm
+     124  2026-10-29 19:36:45      4106.352  soil    73 raw
+     125  2026-10-29 19:36:45      4106.352  level   5.2 cm
+     126  2026-10-29 19:36:46      4107.408  soil    83 raw
+     127  2026-10-29 19:36:46      4107.408  level   2.2 cm
+     128  2026-10-29 19:36:47      4108.464  soil    82 raw
+     129  2026-10-29 19:36:47      4108.464  level   2.3 cm
+     130  2026-10-29 19:36:48      4109.526  soil    81 raw
+     131  2026-10-29 19:36:48      4109.526  level   12.2 cm
+     132  2026-10-29 19:36:49      4110.587  soil    90 raw
+     133  2026-10-29 19:36:49      4110.587  level   11.5 cm
+     134  2026-10-29 19:36:50      4111.644  soil    83 raw
+     135  2026-10-29 19:36:50      4111.644  level   2.6 cm
+     136  2026-10-29 19:36:51      4112.700  soil    91 raw
+     137  2026-10-29 19:36:51      4112.700  level   2.6 cm
+     138  2026-10-29 19:36:52      4113.756  soil    94 raw
+     139  2026-10-29 19:36:52      4113.756  level   9.1 cm
+     140  2026-10-29 19:36:53      4114.817  soil    97 raw
+     141  2026-10-29 19:36:53      4114.817  level   8.7 cm
+     142  2026-10-29 19:36:55      4115.874  soil    96 raw
+     143  2026-10-29 19:36:55      4115.874  level   2.7 cm
+     144  2026-10-29 19:36:56      4116.931  soil    94 raw
+     145  2026-10-29 19:36:56      4116.931  level   4.6 cm
+     146  2026-10-29 19:36:57      4117.991  soil    0 raw
+     147  2026-10-29 19:36:57      4117.991  level   8.0 cm
+     148  2026-10-29 19:36:58      4119.049  soil    0 raw
+     149  2026-10-29 19:36:58      4119.049  level   9.8 cm
+     150  2026-10-29 19:36:59      4120.114  soil    0 raw
+     151  2026-10-29 19:36:59      4120.114  level   16.2 cm
+     152  2026-10-29 19:37:00      4121.170  soil    0 raw
+     153  2026-10-29 19:37:00      4121.170  level   6.5 cm
+     154  2026-10-29 19:37:01      4122.313  soil    0 raw
+     155  2026-10-29 19:37:01      4122.313  level   245.3 cm
+     156  2026-10-29 19:37:02      4123.373  soil    0 raw
+     157  2026-10-29 19:37:02      4123.373  level   17.1 cm
+     158  2026-10-29 19:37:03      4124.434  soil    0 raw
+     159  2026-10-29 19:37:03      4124.434  level   16.2 cm
+     160  2026-10-29 19:37:04      4125.496  soil    0 raw
+     161  2026-10-29 19:37:04      4125.496  level   16.2 cm
+     162  2026-10-29 19:37:05      4126.556  soil    0 raw
+     163  2026-10-29 19:37:05      4126.556  level   16.2 cm
+     164  2026-10-29 19:37:06      4127.617  soil    0 raw
+     165  2026-10-29 19:37:06      4127.617  level   16.2 cm
+     166  2026-10-29 19:37:07      4128.678  soil    0 raw
+     167  2026-10-29 19:37:07      4128.678  level   16.2 cm
+     168  2026-10-29 19:37:08      4129.738  soil    0 raw
+     169  2026-10-29 19:37:08      4129.738  level   16.2 cm
+---
+data dir:   /home/jimmy/plant-data
+writer:     none (no hub holds LOCK)
+records:    170 (last seq 169)
+soil:       0 raw          seq 168      age 1.5 s
+level:      16.2 cm        seq 169      age 1.5 s
+last START: seq 82 at 2026-10-29 19:36:23
+last RECOVERED: seq 80 at 2026-10-29 19:33:39, dropped 13 bytes

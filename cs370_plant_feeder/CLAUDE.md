@@ -72,7 +72,14 @@ After watering, later soil moisture observations can be compared with the condit
 
 ## Build and test
 
-Build, test, sanitizer, and soak test commands will be added when those commands actually exist in the repository.
+Run on the Pi from the repo root (gcc 14, aarch64):
+
+* `make` builds `build/bin/{hub,sampler,plantctl}`.
+* `make test` runs the unit tests (record, store, parse) and the integration scripts (`tests/it_plantctl.sh`, `tests/it_pipeline.sh`).
+* `make asan` rebuilds into `build-asan/` with UBSan and runs the same tests under valgrind memcheck. GCC's ASan cannot run on the stock Pi kernel (39-bit VA); see the Makefile. Needs `sudo apt install valgrind`.
+* Live run: `build/bin/hub &` then `build/bin/sampler` (defaults: data in `~/plant-data`, Uno by `/dev/serial/by-id`). Inspect with `build/bin/plantctl status` and `build/bin/plantctl tail N`.
+
+Not implemented yet, so no commands: supervisor, soak test, power-pull trials.
 
 Do not invent build or test commands for functionality that has not yet been implemented.
 
