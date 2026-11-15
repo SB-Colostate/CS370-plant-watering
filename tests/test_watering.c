@@ -88,6 +88,12 @@ static void safe(void)
     prev_phase = eng_phase(&E);
 }
 
+/* Output of eng_restore_done, checked like any other. */
+static void safe_out(const struct eng_out *o)
+{
+    CHECK(eng_check_output(&E, o) == NULL && o->dropped_info == 0);
+}
+
 static void start_at(uint64_t t0, const struct eng_params *p)
 {
     CHECK(eng_init(&E, p, t0) == 0);
@@ -312,7 +318,8 @@ static void test_restart_cannot_bypass_rate_limit(void)
     /* ...so the hub replays the saved intent into the new engine first. */
     start_at(t1 + 10 * MIN, &p);
     eng_restore_event(&E, ENG_EV_WATER_INTENT, dose, t1);
-    eng_restore_done(&E);
+    eng_restore_event(&E, ENG_EV_DIAG, ENG_DIAG_OK, t1 + 2 * MIN); /* closed, as in a real log */
+    { struct eng_out ro; eng_restore_done(&E, &ro); safe_out(&ro); }
     CHECK(E.restored == 1);
     int t = run_until_start(3600, DRY, FULL);
     CHECK(t > 0);
@@ -323,10 +330,11 @@ static void test_restart_cannot_bypass_daily_cap(void)
 {
     struct eng_params p = test_params();
     start_at(10 * HOUR, &p);
-    eng_restore_event(&E, ENG_EV_WATER_INTENT, 20000, 1 * HOUR);
-    eng_restore_event(&E, ENG_EV_WATER_INTENT, 20000, 3 * HOUR);
-    eng_restore_event(&E, ENG_EV_WATER_INTENT, 20000, 5 * HOUR);
-    eng_restore_done(&E);
+    for (int h = 1; h <= 5; h += 2) {
+        eng_restore_event(&E, ENG_EV_WATER_INTENT, 20000, (uint64_t)h * HOUR);
+        eng_restore_event(&E, ENG_EV_DIAG, ENG_DIAG_OK, (uint64_t)h * HOUR + 2 * MIN);
+    }
+    { struct eng_out ro; eng_restore_done(&E, &ro); safe_out(&ro); }
     steps(60, DRY, FULL);
     CHECK(eng_blocks(&E) & ENG_BLK_DAILY_CAP);
     CHECK(run_until_start(16 * 3600, DRY, FULL) > 0);
@@ -342,7 +350,8 @@ static void test_restored_start_from_earlier_boot_counts_as_now(void)
     struct eng_params p = test_params();
     start_at(1 * HOUR, &p);
     eng_restore_event(&E, ENG_EV_WATER_INTENT, 20000, 30 * 24 * HOUR);
-    eng_restore_done(&E);
+    eng_restore_event(&E, ENG_EV_DIAG, ENG_DIAG_OK, 30 * 24 * HOUR);
+    { struct eng_out ro; eng_restore_done(&E, &ro); safe_out(&ro); }
     int t = run_until_start(2 * 3600, DRY, FULL);
     CHECK(t > 0);
     CHECK(start_times[0] >= 2 * HOUR && start_times[0] <= 2 * HOUR + 2 * SEC);
@@ -353,7 +362,8 @@ static void test_unreadable_restored_dose_assumes_the_worst(void)
     struct eng_params p = test_params();
     start_at(0, &p);
     eng_restore_event(&E, ENG_EV_WATER_INTENT, -5, 0); /* corrupt value */
-    eng_restore_done(&E);
+    eng_restore_event(&E, ENG_EV_DIAG, ENG_DIAG_OK, 0);
+    { struct eng_out ro; eng_restore_done(&E, &ro); safe_out(&ro); }
     steps(2 * 3600, DRY, FULL);
     CHECK(starts == 0 && (eng_blocks(&E) & ENG_BLK_DAILY_CAP)); /* counted as a full 10 min */
 }
@@ -366,7 +376,7 @@ static void test_unreadable_restored_dose_assumes_the_worst(void)
 static void test_many_restarts_and_reboots_never_exceed_limits(void)
 {
     struct eng_params p = test_params();
-    struct { uint64_t mono; int32_t dose; } log[256];
+    struct { uint64_t mono; enum eng_event_kind kind; int32_t value; } log[512];
     int nlog = 0;
     uint64_t real_at[256];
     int32_t dose_at[256];
@@ -375,12 +385,11 @@ static void test_many_restarts_and_reboots_never_exceed_limits(void)
     uint64_t real = 0, boot_real = 0;    /* real time now, and when the current boot began */
     uint32_t x = 7;
 
-    while (real < 6 * 24 * HOUR && nlog < 250) {
+    while (real < 6 * 24 * HOUR && nlog < 500) {
         start_at(real - boot_real + BOOT_MONO, &p);
         for (int i = 0; i < nlog; i++)
-            eng_restore_event(&E, log[i].dose ? ENG_EV_WATER_INTENT : ENG_EV_NONE, log[i].dose,
-                              log[i].mono);
-        eng_restore_done(&E);
+            eng_restore_event(&E, log[i].kind, log[i].value, log[i].mono);
+        { struct eng_out ro; eng_restore_done(&E, &ro); safe_out(&ro); }
 
         x = x * 1103515245u + 12345u;
         uint64_t run_s = 600 + (x >> 8) % (8 * 3600); /* this run lasts 10 min .. 8 h */
@@ -390,7 +399,12 @@ static void test_many_restarts_and_reboots_never_exceed_limits(void)
             step(DRY, FULL);
             if (starts > before) {
                 log[nlog].mono = E.now_ns;
-                log[nlog].dose = saved_intent;
+                log[nlog].kind = ENG_EV_WATER_INTENT;
+                log[nlog].value = saved_intent;
+                nlog++;
+                log[nlog].mono = E.now_ns; /* its verification result (stand-in, see finish_watering) */
+                log[nlog].kind = ENG_EV_DIAG;
+                log[nlog].value = ENG_DIAG_OK;
                 nlog++;
                 real_at[n] = real;
                 dose_at[n] = saved_intent;
@@ -400,7 +414,8 @@ static void test_many_restarts_and_reboots_never_exceed_limits(void)
         }
         /* The real log has samples up to the moment of the crash: keep the last one. */
         log[nlog].mono = E.now_ns;
-        log[nlog].dose = 0;
+        log[nlog].kind = ENG_EV_NONE;
+        log[nlog].value = 0;
         nlog++;
         x = x * 1103515245u + 12345u;
         if ((x >> 16) % 2) {
@@ -434,16 +449,18 @@ static void test_earlier_boot_that_kept_running_ages_correctly(void)
     struct eng_params p = test_params();
     start_at(1 * HOUR, &p);
     eng_restore_event(&E, ENG_EV_WATER_INTENT, 20000, 30 * 24 * HOUR);
+    eng_restore_event(&E, ENG_EV_DIAG, ENG_DIAG_OK, 30 * 24 * HOUR + 2 * MIN);
     eng_restore_event(&E, ENG_EV_NONE, 0, 30 * 24 * HOUR + 25 * HOUR);
-    eng_restore_done(&E);
+    { struct eng_out ro; eng_restore_done(&E, &ro); safe_out(&ro); }
     CHECK(E.n_hist == 0);
     CHECK(run_until_start(200, DRY, FULL) > 0);
 
     /* Only 30 min of later records: at least 30 min old, so 30 min of the interval remain. */
     start_at(1 * HOUR, &p);
     eng_restore_event(&E, ENG_EV_WATER_INTENT, 20000, 30 * 24 * HOUR);
+    eng_restore_event(&E, ENG_EV_DIAG, ENG_DIAG_OK, 30 * 24 * HOUR + 2 * MIN);
     eng_restore_event(&E, ENG_EV_NONE, 0, 30 * 24 * HOUR + 30 * MIN);
-    eng_restore_done(&E);
+    { struct eng_out ro; eng_restore_done(&E, &ro); safe_out(&ro); }
     CHECK(run_until_start(3600, DRY, FULL) > 0);
     CHECK(start_times[0] >= 1 * HOUR + 30 * MIN && start_times[0] <= 1 * HOUR + 30 * MIN + 2 * SEC);
 }
@@ -454,7 +471,7 @@ static void test_restore_ignores_other_events(void)
     eng_restore_event(&E, ENG_EV_PHASE, ENG_WATERING, 0);
     eng_restore_event(&E, ENG_EV_DIAG, ENG_DIAG_OK, 0);
     eng_restore_event(&E, ENG_EV_NONE, 0, 0);
-    eng_restore_done(&E);
+    { struct eng_out ro; eng_restore_done(&E, &ro); safe_out(&ro); }
     CHECK(E.restored == 0 && E.n_hist == 0);
 }
 

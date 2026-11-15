@@ -73,6 +73,7 @@ struct eng_params {
     int32_t level_drop_min_mm; /* water height must fall at least this much to count as a drop */
     int32_t soil_noise;        /* soil changes this small are noise (raw counts) */
     int32_t soil_rise_min;     /* soil must rise at least this much to count as wetter */
+    uint32_t max_inconclusive; /* this many INCONCLUSIVE results in a row (no OK between): lockout */
 
     /* Sensor health. */
     uint32_t stale_ms;  /* no REAL reading for this long: stale. Also the filters' max gap */
@@ -136,6 +137,7 @@ enum eng_diag {
     ENG_DIAG_LEVEL_NOT_TRACKING = 4, /* level unchanged, soil rose */
     ENG_DIAG_INCONCLUSIVE = 5,       /* changes too small to call, or a sensor went stale */
     ENG_DIAG_CHANNELING = 6,         /* reserved: not implemented until we record an episode */
+    ENG_DIAG_CANCELLED = 7,          /* start cancelled before the pump ran: no water moved */
 };
 
 /* Why the engine is in ENG_LOCKOUT. The first reason is kept. */
@@ -149,6 +151,7 @@ enum eng_lock {
     ENG_LOCK_ACTUATOR = 6,           /* pump-control layer could not switch */
     ENG_LOCK_UNEXPECTED_PUMP = 7,    /* pump ran without the engine asking */
     ENG_LOCK_INTERNAL = 8,           /* the engine's own output check failed: an engine bug */
+    ENG_LOCK_TOO_MANY_INCONCLUSIVE = 9, /* waterings keep happening but can't be confirmed */
 };
 
 /* ---------------------------------------------------------------- inputs from pump control */
@@ -178,12 +181,15 @@ enum eng_event_kind {
     ENG_EV_WATER_INTENT = 3, /* value = dose_ms; durable, must be on disk BEFORE the pump starts */
     ENG_EV_DIAG = 4,         /* value = enum eng_diag */
     ENG_EV_LOCKOUT = 5,      /* value = enum eng_lock; durable */
+    ENG_EV_ACK = 6,          /* a person cleared the lockout; value = the reason it had; durable */
 };
+/* Every watering attempt (WATER_INTENT) is closed by exactly one durable DIAG or LOCKOUT event.
+ * After a restart, an intent with neither is an unfinished watering. */
 
 #define ENG_MAX_EVENTS 8
 /* Slots only critical events may use. One call emits at most one of each critical kind
  * (eng_check_output enforces that), so critical events can never be crowded out. */
-#define ENG_RESERVED_EVENTS 3
+#define ENG_RESERVED_EVENTS 4
 
 struct eng_event {
     enum eng_event_kind kind;
@@ -203,7 +209,7 @@ struct eng_out {
     struct eng_event ev[ENG_MAX_EVENTS];
 };
 
-/* WATER_INTENT, DIAG and LOCKOUT are critical: they may use the reserved slots. */
+/* WATER_INTENT, DIAG, LOCKOUT and ACK are critical: they may use the reserved slots. */
 bool eng_event_is_critical(enum eng_event_kind k);
 /* Appends one event. Non-critical events may use only ENG_MAX_EVENTS - ENG_RESERVED_EVENTS
  * slots. Returns false (and counts the drop) if the event did not fit. */
@@ -268,6 +274,12 @@ struct eng {
     unsigned n_pending;
     bool r_overflow;
     uint64_t restored;        /* WATER_INTENT events accepted */
+    bool r_open;              /* the last WATER_INTENT replayed has no closing DIAG/LOCKOUT */
+    bool r_locked;            /* a lockout replayed with no ACK after it */
+    enum eng_lock r_lock_reason;
+
+    uint32_t inconclusive_run; /* INCONCLUSIVE results since the last OK or ACK */
+    bool ack_pending;          /* ACK emitted, not yet confirmed saved by the hub */
 
     /* The current watering. */
     uint64_t requested_ns;      /* START requested */
@@ -300,20 +312,40 @@ int eng_init(struct eng *e, const struct eng_params *p, uint64_t now_ns);
  * are counted in `rejected` and otherwise ignored. */
 void eng_on_sample(struct eng *e, const struct record *r, struct eng_out *out);
 
-/* After a restart, the hub replays the log so that a restart (or reboot) cannot reset the rate
- * limit or the daily cap. Call after eng_init and before any live input:
+/* After a restart, the hub replays the log so that a restart (or reboot) can neither reset the
+ * limits nor clear a fault. Call after eng_init and before any live input:
  *   - eng_restore_event() for log records, oldest first. kind is the engine event the record
  *     holds, or ENG_EV_NONE for any other record (samples, START...): only its time is used.
- *     Only WATER_INTENT changes the limits. Pass every WATER_INTENT in the log, unfiltered.
- *   - eng_restore_done() once at the end. (The first live input does it if the hub forgets.)
- * t_ns is the record's CLOCK_MONOTONIC time, which restarts at every boot. The engine sees a
- * reboot wherever the time goes backwards, and joins the boots end to end, counting the time
- * between them as zero. That gives a LOWER BOUND on how long ago each start was, so a past start
- * can only look more recent than it really was: safe, and not much more cautious than needed.
- * The more records the hub replays (not only intents), the tighter the bound.
- * A dose that is <= 0 or >= the pump cap is unreadable: it counts as a full pump cap. */
+ *     Pass every engine event in the log, unfiltered.
+ *   - eng_restore_done() once at the end, and handle its output like any other (it may lock out
+ *     and request STOP). The first live input calls it if the hub forgets.
+ * What is rebuilt:
+ *   - rate limit and daily cap, from WATER_INTENT;
+ *   - a lockout with no ACK after it, from LOCKOUT, or derived from a fault DIAG or from the
+ *     INCONCLUSIVE run reaching max_inconclusive (in case the LOCKOUT record itself was lost);
+ *   - the INCONCLUSIVE run (DIAG OK and ACK reset it);
+ *   - an intent with no closing DIAG/LOCKOUT: ENG_LOCK_UNFINISHED_WATERING.
+ * Times: t_ns is the record's CLOCK_MONOTONIC time, which restarts at every boot. The engine
+ * sees a reboot wherever the time goes backwards and joins the boots end to end, counting the
+ * time between them as zero. That gives a LOWER BOUND on how long ago each start was, so a past
+ * start can only look more recent than it really was. The more records replayed, the tighter.
+ * Unreadable values are read the cautious way: a dose <= 0 or >= the pump cap counts as a full
+ * cap; an unknown lock reason still locks (as INTERNAL); an unknown DIAG counts as INCONCLUSIVE. */
 void eng_restore_event(struct eng *e, enum eng_event_kind kind, int32_t value, uint64_t t_ns);
-void eng_restore_done(struct eng *e);
+void eng_restore_done(struct eng *e, struct eng_out *out);
+
+/* Clearing a lockout takes two steps, so a fault is never cleared without a saved record of it:
+ *   1. eng_acknowledge(): a person has looked at the plant. Emits a durable ACK and marks it
+ *      pending. The engine STAYS in ENG_LOCKOUT (and keeps requesting STOP) until step 2.
+ *      Calling it again while pending emits the ACK again (for a hub that retries the save).
+ *   2. eng_ack_saved(): the hub calls this only after the ACK record was appended durably. Only
+ *      now: back to IDLE, the INCONCLUSIVE run reset. If the save fails the hub must not call it;
+ *      after a restart the ACK is not in the log, so the lockout is restored.
+ * The rate limit and daily cap are NOT reset. Both are no-ops unless locked out. An ACK replayed
+ * by eng_restore_event() is already on disk and counts as saved.
+ * (Getting the acknowledgement to the engine is the hub's job: plantctl -> hub.) */
+void eng_acknowledge(struct eng *e, uint64_t now_ns, struct eng_out *out);
+void eng_ack_saved(struct eng *e, uint64_t now_ns, struct eng_out *out);
 
 /* Call at least once per second. Drives the time-based rules. */
 void eng_tick(struct eng *e, uint64_t now_ns, struct eng_out *out);

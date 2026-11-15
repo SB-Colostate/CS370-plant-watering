@@ -59,6 +59,7 @@
 #define CFG_ENG_LEVEL_DROP_MIN_MM   10      /* UNMEASURED: depends on tank area and dose */
 #define CFG_ENG_SOIL_NOISE          10      /* UNMEASURED placeholder */
 #define CFG_ENG_SOIL_RISE_MIN       30      /* UNMEASURED placeholder */
+#define CFG_ENG_MAX_INCONCLUSIVE    3       /* INCONCLUSIVE results in a row before lockout; placeholder */
 #define CFG_ENG_STALE_MS            5000    /* DESIGN §6 #4 target: fault noticed within 5 s */
 #define CFG_ENG_WARMUP_MS           30000   /* UNMEASURED */
 

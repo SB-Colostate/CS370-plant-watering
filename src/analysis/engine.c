@@ -33,6 +33,7 @@ void eng_params_default(struct eng_params *p)
     p->level_drop_min_mm = CFG_ENG_LEVEL_DROP_MIN_MM;
     p->soil_noise = CFG_ENG_SOIL_NOISE;
     p->soil_rise_min = CFG_ENG_SOIL_RISE_MIN;
+    p->max_inconclusive = CFG_ENG_MAX_INCONCLUSIVE;
     p->stale_ms = CFG_ENG_STALE_MS;
     p->warmup_ms = CFG_ENG_WARMUP_MS;
 }
@@ -88,6 +89,8 @@ const char *eng_params_check(const struct eng_params *p)
         return "level_drop_min_mm must be > level_noise_mm >= 0";
     if (p->soil_noise < 0 || p->soil_rise_min <= p->soil_noise)
         return "soil_rise_min must be > soil_noise >= 0";
+    if (p->max_inconclusive == 0)
+        return "max_inconclusive is 0";
     return NULL;
 }
 
@@ -100,7 +103,7 @@ int32_t eng_water_height_mm(const struct eng_params *p, int32_t dist_mm)
 
 bool eng_event_is_critical(enum eng_event_kind k)
 {
-    return k == ENG_EV_WATER_INTENT || k == ENG_EV_DIAG || k == ENG_EV_LOCKOUT;
+    return k == ENG_EV_WATER_INTENT || k == ENG_EV_DIAG || k == ENG_EV_LOCKOUT || k == ENG_EV_ACK;
 }
 
 bool eng_out_push(struct eng_out *out, enum eng_event_kind kind, int32_t value, bool durable)
@@ -140,7 +143,7 @@ const char *eng_check_output(const struct eng *e, const struct eng_out *out)
     if (out->dropped_critical > 0)
         return "a critical event did not fit";
     if (count_kind(out, ENG_EV_WATER_INTENT) > 1 || count_kind(out, ENG_EV_DIAG) > 1 ||
-        count_kind(out, ENG_EV_LOCKOUT) > 1)
+        count_kind(out, ENG_EV_LOCKOUT) > 1 || count_kind(out, ENG_EV_ACK) > 1)
         return "more than one critical event of the same kind";
 
     if (out->request != ENG_REQ_START)
@@ -197,7 +200,14 @@ static void enter_lockout(struct eng *e, enum eng_lock why, struct eng_out *out)
 
 void eng_enforce_output(struct eng *e, struct eng_out *out)
 {
-    if (eng_check_output(e, out) == NULL)
+    /* Check first, so a START produced while locked out still counts as an engine bug... */
+    bool unsafe = eng_check_output(e, out) != NULL;
+    /* ...then the one place that makes "locked out => every call requests STOP" true. */
+    if (e->phase == ENG_LOCKOUT) {
+        out->request = ENG_REQ_STOP;
+        out->dose_ms = 0;
+    }
+    if (!unsafe)
         return;
     e->internal_faults++;
     /* Never pass an unsafe request on. If the engine was already locked out, enter_lockout
@@ -300,6 +310,35 @@ static uint64_t restore_clock(struct eng *e, uint64_t t_ns)
     return t_ns + e->r_offset;
 }
 
+/* A lockout seen in the log. The first one since the last ACK keeps its reason, as live. */
+static void restore_lock(struct eng *e, enum eng_lock why)
+{
+    if (!e->r_locked) {
+        e->r_locked = true;
+        e->r_lock_reason = why;
+    }
+}
+
+static void restore_diag(struct eng *e, int32_t value)
+{
+    e->r_open = false;
+    switch (value) {
+    case ENG_DIAG_OK:
+        e->inconclusive_run = 0;
+        break;
+    case ENG_DIAG_CANCELLED:
+        break; /* no water moved: neutral */
+    case ENG_DIAG_PUMP_NO_FLOW: restore_lock(e, ENG_LOCK_PUMP_NO_FLOW); break;
+    case ENG_DIAG_LEAK_OR_PROBE_OUT: restore_lock(e, ENG_LOCK_LEAK_OR_PROBE_OUT); break;
+    case ENG_DIAG_LEVEL_NOT_TRACKING: restore_lock(e, ENG_LOCK_LEVEL_NOT_TRACKING); break;
+    default: /* INCONCLUSIVE, or a value we can't read: count it as INCONCLUSIVE */
+        e->inconclusive_run++;
+        if (e->inconclusive_run >= e->p.max_inconclusive)
+            restore_lock(e, ENG_LOCK_TOO_MANY_INCONCLUSIVE);
+        break;
+    }
+}
+
 void eng_restore_event(struct eng *e, enum eng_event_kind kind, int32_t value, uint64_t t_ns)
 {
     if (!e->params_ok || e->live)
@@ -313,8 +352,31 @@ void eng_restore_event(struct eng *e, enum eng_event_kind kind, int32_t value, u
             e->pending[k++] = e->pending[i];
     e->n_pending = k;
 
-    if (kind != ENG_EV_WATER_INTENT)
+    switch (kind) {
+    case ENG_EV_WATER_INTENT:
+        break; /* below */
+    case ENG_EV_DIAG:
+        restore_diag(e, value);
         return;
+    case ENG_EV_LOCKOUT:
+        e->r_open = false;
+        restore_lock(e, value >= ENG_LOCK_PUMP_NO_FLOW && value <= ENG_LOCK_TOO_MANY_INCONCLUSIVE
+                            ? (enum eng_lock)value
+                            : ENG_LOCK_INTERNAL); /* unreadable reason: still locked */
+        return;
+    case ENG_EV_ACK:
+        e->r_locked = false;
+        e->r_lock_reason = ENG_LOCK_NONE;
+        e->inconclusive_run = 0;
+        return;
+    case ENG_EV_NONE:
+    case ENG_EV_PHASE:
+    case ENG_EV_BLOCKS:
+        return; /* time only */
+    }
+    if (e->r_open)
+        restore_lock(e, ENG_LOCK_UNFINISHED_WATERING); /* the previous one never finished */
+    e->r_open = true; /* closed by a later DIAG or LOCKOUT */
     uint32_t dose = (value <= 0 || (uint32_t)value >= e->p.pump_cap_ms)
                         ? e->p.pump_cap_ms /* unreadable: assume the worst */
                         : (uint32_t)value;
@@ -326,10 +388,15 @@ void eng_restore_event(struct eng *e, enum eng_event_kind kind, int32_t value, u
     e->restored++;
 }
 
-void eng_restore_done(struct eng *e)
+void eng_restore_done(struct eng *e, struct eng_out *out)
 {
-    if (!e->params_ok || e->live)
+    /* Public input like any other: clear the output first and check it last. (The implicit
+     * calls from the first live input pass an output that was just cleared anyway.) */
+    out_reset(out);
+    if (!e->params_ok || e->live) {
+        eng_enforce_output(e, out);
         return;
+    }
     e->live = true;
     /* "Now" is the next point on the continuous clock (a reboot since the last record shows
      * up as now < r_last). Ages are lower bounds; turn them into times on this boot's clock. */
@@ -342,6 +409,18 @@ void eng_restore_done(struct eng *e)
     e->n_pending = 0;
     if (e->r_overflow)
         e->capped_until_ns = e->now_ns + (uint64_t)ENG_DAY_MS * MS;
+
+    /* Faults survive restarts. A lockout already in the log is resumed without logging it
+     * again; an unfinished watering is a new finding and is logged. */
+    if (e->r_locked) {
+        e->phase = ENG_LOCKOUT; /* eng_enforce_output below requests STOP */
+        e->lock_reason = e->r_lock_reason;
+    } else if (e->r_open) {
+        enter_lockout(e, ENG_LOCK_UNFINISHED_WATERING, out); /* crashed or rebooted mid-watering */
+    } else if (e->inconclusive_run >= e->p.max_inconclusive) {
+        enter_lockout(e, ENG_LOCK_TOO_MANY_INCONCLUSIVE, out);
+    }
+    eng_enforce_output(e, out);
 }
 
 /* ---------------------------------------------------------------- watering decision */
@@ -460,10 +539,21 @@ static void finish_verification(struct eng *e, enum eng_diag d, struct eng_out *
     case ENG_DIAG_LEAK_OR_PROBE_OUT: enter_lockout(e, ENG_LOCK_LEAK_OR_PROBE_OUT, out); break;
     case ENG_DIAG_LEVEL_NOT_TRACKING: enter_lockout(e, ENG_LOCK_LEVEL_NOT_TRACKING, out); break;
     case ENG_DIAG_OK:
+        e->inconclusive_run = 0;
+        set_phase(e, ENG_IDLE, out); /* the limits still count this watering */
+        break;
     case ENG_DIAG_INCONCLUSIVE:
+        /* Water may have gone in without us knowing. Not forever: that is how overwatering
+         * would happen with nobody noticing. */
+        if (++e->inconclusive_run >= e->p.max_inconclusive)
+            enter_lockout(e, ENG_LOCK_TOO_MANY_INCONCLUSIVE, out);
+        else
+            set_phase(e, ENG_IDLE, out);
+        break;
     case ENG_DIAG_NONE:
     case ENG_DIAG_CHANNELING:
-        set_phase(e, ENG_IDLE, out); /* the limits still count this watering */
+    case ENG_DIAG_CANCELLED:
+        set_phase(e, ENG_IDLE, out);
         break;
     }
 }
@@ -520,11 +610,8 @@ static void watch_watering(struct eng *e, struct eng_out *out)
 
 static void decide(struct eng *e, struct eng_out *out)
 {
-    if (e->phase == ENG_LOCKOUT) {
-        out->request = ENG_REQ_STOP; /* on every call, for as long as it lasts */
-        out->dose_ms = 0;
-        return;
-    }
+    if (e->phase == ENG_LOCKOUT)
+        return; /* nothing to decide; eng_enforce_output requests STOP */
     if (!e->params_ok)
         return;
     update_dryness(e);
@@ -695,7 +782,7 @@ static void update_blocks(struct eng *e, struct eng_out *out)
 void eng_on_sample(struct eng *e, const struct record *r, struct eng_out *out)
 {
     out_reset(out);
-    eng_restore_done(e); /* no-op once live */
+    eng_restore_done(e, out); /* no-op once live */
     /* An engine with invalid params never set up its filters: it ignores every sample. */
     if (e->params_ok && take_sample(e, r)) {
         e->samples++;
@@ -711,7 +798,7 @@ void eng_on_sample(struct eng *e, const struct record *r, struct eng_out *out)
 void eng_tick(struct eng *e, uint64_t now_ns, struct eng_out *out)
 {
     out_reset(out);
-    eng_restore_done(e); /* no-op once live */
+    eng_restore_done(e, out); /* no-op once live */
     note_time(e, now_ns);
     update_blocks(e, out); /* a sensor that has gone quiet turns stale here */
     decide(e, out);
@@ -745,6 +832,8 @@ void eng_on_watering_stopped(struct eng *e, uint64_t now_ns, uint32_t ran_ms, en
     if (e->phase == ENG_START_REQUESTED) {
         if (ran_ms == 0 && e->stop_requested) {
             end_watering(e); /* our cancel, confirmed before any water moved */
+            e->last_diag = ENG_DIAG_CANCELLED;
+            eng_out_push(out, ENG_EV_DIAG, ENG_DIAG_CANCELLED, true); /* closes the attempt */
             set_phase(e, ENG_IDLE, out);
         } else {
             /* Refused, failed, or ran without confirming the start first. */
@@ -770,8 +859,35 @@ void eng_on_watering_stopped(struct eng *e, uint64_t now_ns, uint32_t ran_ms, en
          * A stop saying the pump actually ran means water moved without our request. */
         if (ran_ms > 0)
             enter_lockout(e, ENG_LOCK_UNEXPECTED_PUMP, out);
-        else if (e->phase == ENG_LOCKOUT)
-            out->request = ENG_REQ_STOP;
+    }
+    eng_enforce_output(e, out);
+}
+
+void eng_acknowledge(struct eng *e, uint64_t now_ns, struct eng_out *out)
+{
+    out_reset(out);
+    note_time(e, now_ns);
+    eng_restore_done(e, out); /* acknowledging what the log says, not a blank engine */
+    if (e->params_ok && e->phase == ENG_LOCKOUT) {
+        /* Step 1 only: ask the hub to save the ACK. Still locked out (decide() keeps asking for
+         * STOP) until eng_ack_saved(). */
+        eng_out_push(out, ENG_EV_ACK, (int32_t)e->lock_reason, true);
+        e->ack_pending = true;
+    }
+    eng_enforce_output(e, out);
+}
+
+void eng_ack_saved(struct eng *e, uint64_t now_ns, struct eng_out *out)
+{
+    out_reset(out);
+    note_time(e, now_ns);
+    if (e->params_ok && e->phase == ENG_LOCKOUT && e->ack_pending) {
+        e->ack_pending = false;
+        e->lock_reason = ENG_LOCK_NONE;
+        e->inconclusive_run = 0;
+        end_watering(e);
+        set_phase(e, ENG_IDLE, out);
+        /* History (rate limit, daily cap) is deliberately kept. */
     }
     eng_enforce_output(e, out);
 }
@@ -823,6 +939,7 @@ const char *eng_diag_name(enum eng_diag d)
     case ENG_DIAG_LEVEL_NOT_TRACKING: return "LEVEL_NOT_TRACKING";
     case ENG_DIAG_INCONCLUSIVE: return "INCONCLUSIVE";
     case ENG_DIAG_CHANNELING: return "CHANNELING";
+    case ENG_DIAG_CANCELLED: return "CANCELLED";
     }
     return "?";
 }
@@ -839,6 +956,7 @@ const char *eng_lock_name(enum eng_lock l)
     case ENG_LOCK_ACTUATOR: return "ACTUATOR";
     case ENG_LOCK_UNEXPECTED_PUMP: return "UNEXPECTED_PUMP";
     case ENG_LOCK_INTERNAL: return "INTERNAL";
+    case ENG_LOCK_TOO_MANY_INCONCLUSIVE: return "TOO_MANY_INCONCLUSIVE";
     }
     return "?";
 }

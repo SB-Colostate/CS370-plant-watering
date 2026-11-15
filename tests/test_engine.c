@@ -132,6 +132,7 @@ static void test_bad_params_rejected(void)
     BAD("stale_ms", p.stale_ms = 0);
     BAD("start_confirm_ms", p.start_confirm_ms = 0);
     BAD("verify_window_ms", p.verify_window_ms = 0);
+    BAD("max_inconclusive", p.max_inconclusive = 0);
     BAD("level_drop_min_mm", p.level_drop_min_mm = p.level_noise_mm);   /* no gap: borderline = changed */
     BAD("level_drop_min_mm", p.level_noise_mm = -1);
     BAD("soil_rise_min", p.soil_rise_min = p.soil_noise);
@@ -355,11 +356,12 @@ static void test_out_push_reserves_slots_for_critical_events(void)
     /* One of each critical kind still fits. */
     CHECK(eng_out_push(&out, ENG_EV_WATER_INTENT, 5000, true));
     CHECK(eng_out_push(&out, ENG_EV_DIAG, ENG_DIAG_OK, false));
+    CHECK(eng_out_push(&out, ENG_EV_ACK, ENG_LOCK_PUMP_NO_FLOW, true));
     CHECK(eng_out_push(&out, ENG_EV_LOCKOUT, ENG_LOCK_PUMP_TIMEOUT, true));
     CHECK(out.n_events == ENG_MAX_EVENTS && out.dropped_critical == 0);
     CHECK(out.ev[ENG_MAX_EVENTS - 1].kind == ENG_EV_LOCKOUT);
 
-    /* A fourth critical event cannot fit: counted, never silent. */
+    /* One more critical event cannot fit: counted, never silent. */
     CHECK(!eng_out_push(&out, ENG_EV_LOCKOUT, ENG_LOCK_ACTUATOR, true));
     CHECK(out.dropped_critical == 1);
 }
@@ -528,9 +530,9 @@ static void test_names_cover_enums(void)
             CHECK(strcmp(eng_block_name(b), eng_block_name(c)) != 0);
     }
     CHECK(strcmp(eng_block_name(ENG_BLK_ALL), "?") == 0); /* names are for single bits */
-    for (int d = ENG_DIAG_NONE; d <= ENG_DIAG_CHANNELING; d++)
+    for (int d = ENG_DIAG_NONE; d <= ENG_DIAG_CANCELLED; d++)
         CHECK(strcmp(eng_diag_name((enum eng_diag)d), "?") != 0);
-    for (int l = ENG_LOCK_NONE; l <= ENG_LOCK_INTERNAL; l++)
+    for (int l = ENG_LOCK_NONE; l <= ENG_LOCK_TOO_MANY_INCONCLUSIVE; l++)
         CHECK(strcmp(eng_lock_name((enum eng_lock)l), "?") != 0);
     for (int r = ENG_REQ_NONE; r <= ENG_REQ_STOP; r++)
         CHECK(strcmp(eng_request_name((enum eng_request)r), "?") != 0);
