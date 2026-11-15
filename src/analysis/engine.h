@@ -11,6 +11,12 @@
  * (dose out of range, start while blocked, start with no durable intent, a lost critical event)
  * is replaced by STOP and the engine locks out with ENG_LOCK_INTERNAL.
  *
+ * What the engine does NOT do: switch anything off. ENG_REQ_STOP is a request, like START. If the
+ * hub hangs, the engine stops being called at all. So pump control must enforce its own hard cap
+ * (CFG_PUMP_CAP_MS) and turn the pump off on its own when it stops hearing from the hub, and the
+ * supervisor must force the pump OFF when the hub dies or hangs. Those are separate from this
+ * file and must not depend on it.
+ *
  * Pure code: no system calls, no clock reads, no I/O, no malloc, no globals. Time is always an
  * argument, in CLOCK_MONOTONIC nanoseconds (the clock the sampler stamps every sample with), so
  * every behavior can be tested without hardware and without sleeping.
@@ -58,6 +64,15 @@ struct eng_params {
     uint32_t start_confirm_ms; /* pump control must confirm a START within this */
     uint32_t stop_grace_ms;    /* ...and a stop (dose end or STOP) within this; dose + 2 * grace
                                 * must stay below pump_cap_ms */
+
+    /* Verification: did the water arrive? Compared before (at the request) vs. after (end of
+     * the window), on FILTERED values. A change within +-noise is "no change"; at least *_min is
+     * "changed"; anything else (between them, or the wrong way) is too unclear to call. */
+    uint32_t verify_window_ms; /* after the pump stops, wait this long for the soil to respond */
+    int32_t level_noise_mm;    /* water height changes this small are noise */
+    int32_t level_drop_min_mm; /* water height must fall at least this much to count as a drop */
+    int32_t soil_noise;        /* soil changes this small are noise (raw counts) */
+    int32_t soil_rise_min;     /* soil must rise at least this much to count as wetter */
 
     /* Sensor health. */
     uint32_t stale_ms;  /* no REAL reading for this long: stale. Also the filters' max gap */
@@ -262,6 +277,15 @@ struct eng {
     uint32_t ran_ms;            /* as reported when the dose ended */
     enum eng_stop stop_why;
 
+    /* Verification of the current watering. */
+    int32_t soil_before;        /* smoothed soil at the request */
+    int32_t water_before_mm;    /* filtered water height at the request */
+    int32_t soil_peak;          /* highest smoothed soil since the request */
+    uint64_t verify_start_ns;   /* pump stopped */
+    bool verify_data_lost;      /* a sensor was stale/no-echo/at the rail since the request */
+    int32_t verify_level_drop_mm, verify_soil_rise; /* what was measured (if anything) */
+    enum eng_diag last_diag;
+
     uint64_t samples;            /* accepted samples */
     uint64_t rejected;           /* records that were not a valid soil/level sample */
     uint64_t unexpected_reports; /* pump-control reports that did not match our phase */
@@ -321,6 +345,13 @@ enum eng_reservoir eng_reservoir(const struct eng *e);
  * mean a start was requested: that also needs every block clear (sensors, reservoir, rate limit,
  * daily cap), and the request itself is only a request. */
 bool eng_needs_water(const struct eng *e);
+enum eng_diag eng_last_diag(const struct eng *e);
+
+/* The fusion table, as a pure function of the two measured changes (water height drop in mm,
+ * soil rise in counts). Returns OK, PUMP_NO_FLOW, LEAK_OR_PROBE_OUT, LEVEL_NOT_TRACKING, or
+ * INCONCLUSIVE when either change is too unclear to call. The engine calls it only for a full
+ * dose with clean data from both sensors; otherwise the result is INCONCLUSIVE without asking. */
+enum eng_diag eng_classify(const struct eng_params *p, int32_t level_drop_mm, int32_t soil_rise);
 
 /* Short stable names for logs and plantctl. Unknown values give "?". */
 const char *eng_phase_name(enum eng_phase ph);

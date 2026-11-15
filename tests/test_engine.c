@@ -131,6 +131,11 @@ static void test_bad_params_rejected(void)
     BAD("daily_dose_ms", p.daily_dose_ms = p.dose_ms - 1);
     BAD("stale_ms", p.stale_ms = 0);
     BAD("start_confirm_ms", p.start_confirm_ms = 0);
+    BAD("verify_window_ms", p.verify_window_ms = 0);
+    BAD("level_drop_min_mm", p.level_drop_min_mm = p.level_noise_mm);   /* no gap: borderline = changed */
+    BAD("level_drop_min_mm", p.level_noise_mm = -1);
+    BAD("soil_rise_min", p.soil_rise_min = p.soil_noise);
+    BAD("soil_rise_min", p.soil_noise = -1);
     BAD("stop_grace_ms", p.stop_grace_ms = 0);
     BAD("stop_grace_ms", p.stop_grace_ms = (p.pump_cap_ms - p.dose_ms) / 2); /* stop + give-up must fit before the cap */
 #undef BAD

@@ -28,6 +28,11 @@ void eng_params_default(struct eng_params *p)
     p->daily_dose_ms = CFG_ENG_DAILY_DOSE_MS;
     p->start_confirm_ms = CFG_ENG_START_CONFIRM_MS;
     p->stop_grace_ms = CFG_ENG_STOP_GRACE_MS;
+    p->verify_window_ms = CFG_ENG_VERIFY_WINDOW_MS;
+    p->level_noise_mm = CFG_ENG_LEVEL_NOISE_MM;
+    p->level_drop_min_mm = CFG_ENG_LEVEL_DROP_MIN_MM;
+    p->soil_noise = CFG_ENG_SOIL_NOISE;
+    p->soil_rise_min = CFG_ENG_SOIL_RISE_MIN;
     p->stale_ms = CFG_ENG_STALE_MS;
     p->warmup_ms = CFG_ENG_WARMUP_MS;
 }
@@ -76,6 +81,13 @@ const char *eng_params_check(const struct eng_params *p)
     /* The engine must ask for STOP, and give up on pump control, before the cap. */
     if (p->stop_grace_ms == 0 || (uint64_t)p->dose_ms + 2u * p->stop_grace_ms >= p->pump_cap_ms)
         return "stop_grace_ms must be > 0 with dose_ms + 2 * stop_grace_ms < pump_cap_ms";
+    if (p->verify_window_ms == 0)
+        return "verify_window_ms is 0";
+    /* A gap between "noise" and "changed" keeps borderline readings out of both. */
+    if (p->level_noise_mm < 0 || p->level_drop_min_mm <= p->level_noise_mm)
+        return "level_drop_min_mm must be > level_noise_mm >= 0";
+    if (p->soil_noise < 0 || p->soil_rise_min <= p->soil_noise)
+        return "soil_rise_min must be > soil_noise >= 0";
     return NULL;
 }
 
@@ -366,6 +378,12 @@ static void request_start(struct eng *e, struct eng_out *out)
     history_add(e, (int64_t)e->now_ns, dose);
     e->requested_ns = e->now_ns;
     e->stop_requested = false;
+    /* "Before" for the verification: filtered values, taken while both sensors are trusted. */
+    e->soil_before = soil_filter_value(&e->soil);
+    e->soil_peak = e->soil_before;
+    e->water_before_mm = eng_water_height_mm(&e->p, level_filter_dist_mm(&e->level));
+    e->verify_data_lost = false;
+    e->verify_level_drop_mm = e->verify_soil_rise = 0;
     set_phase(e, ENG_START_REQUESTED, out);
     out->request = ENG_REQ_START;
     out->dose_ms = dose;
@@ -387,9 +405,90 @@ static void end_watering(struct eng *e)
     e->stop_requested = false;
 }
 
+/* ---------------------------------------------------------------- verification */
+
+#define DATA_BLOCKS \
+    (ENG_BLK_SOIL_STALE | ENG_BLK_LEVEL_STALE | ENG_BLK_LEVEL_NO_ECHO | ENG_BLK_SOIL_RAIL)
+
+enum band { BAND_NONE, BAND_CHANGED, BAND_UNCLEAR };
+
+/* Within +-noise: no change. At least min: changed. Anything else, including a change the
+ * wrong way (water level rose, soil got drier), is too unclear to call. */
+static enum band change_band(int32_t change, int32_t noise, int32_t min)
+{
+    if (change >= min)
+        return BAND_CHANGED;
+    if (change >= -noise && change <= noise)
+        return BAND_NONE;
+    return BAND_UNCLEAR;
+}
+
+enum eng_diag eng_classify(const struct eng_params *p, int32_t level_drop_mm, int32_t soil_rise)
+{
+    enum band level = change_band(level_drop_mm, p->level_noise_mm, p->level_drop_min_mm);
+    enum band soil = change_band(soil_rise, p->soil_noise, p->soil_rise_min);
+    if (level == BAND_UNCLEAR || soil == BAND_UNCLEAR)
+        return ENG_DIAG_INCONCLUSIVE;
+    if (level == BAND_CHANGED && soil == BAND_CHANGED)
+        return ENG_DIAG_OK;                 /* water left the tank and reached the soil */
+    if (level == BAND_NONE && soil == BAND_NONE)
+        return ENG_DIAG_PUMP_NO_FLOW;       /* nothing moved: pump, relay or line */
+    if (level == BAND_CHANGED)
+        return ENG_DIAG_LEAK_OR_PROBE_OUT;  /* water left, soil didn't notice */
+    return ENG_DIAG_LEVEL_NOT_TRACKING;     /* soil wetter, tank unchanged: gauge not tracking */
+}
+
+/* While watering and verifying: remember the wettest smoothed soil, and whether either sensor
+ * ever stopped being trustworthy. */
+static void track_verification(struct eng *e)
+{
+    if (e->blocks & DATA_BLOCKS) {
+        e->verify_data_lost = true;
+        return;
+    }
+    int32_t v = soil_filter_value(&e->soil);
+    if (v > e->soil_peak)
+        e->soil_peak = v;
+}
+
+static void finish_verification(struct eng *e, enum eng_diag d, struct eng_out *out)
+{
+    e->last_diag = d;
+    eng_out_push(out, ENG_EV_DIAG, (int32_t)d, true);
+    switch (d) {
+    case ENG_DIAG_PUMP_NO_FLOW: enter_lockout(e, ENG_LOCK_PUMP_NO_FLOW, out); break;
+    case ENG_DIAG_LEAK_OR_PROBE_OUT: enter_lockout(e, ENG_LOCK_LEAK_OR_PROBE_OUT, out); break;
+    case ENG_DIAG_LEVEL_NOT_TRACKING: enter_lockout(e, ENG_LOCK_LEVEL_NOT_TRACKING, out); break;
+    case ENG_DIAG_OK:
+    case ENG_DIAG_INCONCLUSIVE:
+    case ENG_DIAG_NONE:
+    case ENG_DIAG_CHANNELING:
+        set_phase(e, ENG_IDLE, out); /* the limits still count this watering */
+        break;
+    }
+}
+
+static void watch_verify(struct eng *e, struct eng_out *out)
+{
+    track_verification(e);
+    if (elapsed_ns(e->now_ns, e->verify_start_ns) < (uint64_t)e->p.verify_window_ms * MS)
+        return;
+    /* Only a full dose with trustworthy data the whole time can be judged. */
+    bool full_dose = e->stop_why == ENG_STOP_DOSE_DONE && e->ran_ms >= e->p.dose_ms;
+    if (!full_dose || e->verify_data_lost) {
+        finish_verification(e, ENG_DIAG_INCONCLUSIVE, out);
+        return;
+    }
+    int32_t water_after = eng_water_height_mm(&e->p, level_filter_dist_mm(&e->level));
+    e->verify_level_drop_mm = e->water_before_mm - water_after;
+    e->verify_soil_rise = e->soil_peak - e->soil_before;
+    finish_verification(e, eng_classify(&e->p, e->verify_level_drop_mm, e->verify_soil_rise), out);
+}
+
 /* START sent, not confirmed yet. */
 static void watch_start(struct eng *e, struct eng_out *out)
 {
+    track_verification(e);
     if (e->blocks & ENG_BLK_SAFETY)
         ask_stop(e, out); /* something went wrong before it even started: cancel */
     if (elapsed_ns(e->now_ns, e->requested_ns) > (uint64_t)e->p.start_confirm_ms * MS)
@@ -401,6 +500,7 @@ static void watch_start(struct eng *e, struct eng_out *out)
 /* Pump confirmed running. */
 static void watch_watering(struct eng *e, struct eng_out *out)
 {
+    track_verification(e);
     uint64_t on_ns = elapsed_ns(e->now_ns, e->started_ns);
     if (on_ns >= (uint64_t)e->p.pump_cap_ms * MS) {
         /* Backstop: unreachable with valid params (see eng_params_check), kept on purpose. */
@@ -448,7 +548,8 @@ static void decide(struct eng *e, struct eng_out *out)
         watch_watering(e, out);
         break;
     case ENG_VERIFYING:
-        break; /* commit 6: check the water arrived */
+        watch_verify(e, out);
+        break;
     case ENG_LOCKOUT:
         break; /* handled above */
     }
@@ -659,8 +760,10 @@ void eng_on_watering_stopped(struct eng *e, uint64_t now_ns, uint32_t ran_ms, en
         else if (why == ENG_STOP_ACT_FAIL || ran_ms > e->p.dose_ms + e->p.stop_grace_ms ||
                  (why == ENG_STOP_REQUESTED && !we_asked))
             enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* failed, overran, or the story is wrong */
-        else
+        else {
+            e->verify_start_ns = e->now_ns;
             set_phase(e, ENG_VERIFYING, out);
+        }
     } else {
         e->unexpected_reports++;
         /* A stop with ran_ms == 0 is harmless (e.g. confirming a STOP we sent while idle).
@@ -679,6 +782,7 @@ enum eng_phase eng_phase(const struct eng *e) { return e->phase; }
 uint32_t eng_blocks(const struct eng *e) { return e->blocks; }
 enum eng_lock eng_lock_reason(const struct eng *e) { return e->lock_reason; }
 enum eng_reservoir eng_reservoir(const struct eng *e) { return e->res; }
+enum eng_diag eng_last_diag(const struct eng *e) { return e->last_diag; }
 
 const char *eng_phase_name(enum eng_phase ph)
 {
