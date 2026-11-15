@@ -17,6 +17,19 @@ static void check_out(const struct eng *e, const struct eng_out *out)
         fprintf(stderr, "    unsafe output: %s\n", why);
     CHECK(out->dropped_info == 0);
     CHECK(e->internal_faults == 0);
+    /* Checked here directly, not only through the engine's own eng_check_output: */
+    if (out->request == ENG_REQ_START) {
+        CHECK(eng_blocks(e) == 0);                                      /* no blocking condition */
+        CHECK(eng_phase(e) == ENG_START_REQUESTED);
+        CHECK(e->now_ns - e->dry_since_ns >= (uint64_t)e->p.dry_dwell_ms * 1000000u); /* dwell done */
+        CHECK(out->dose_ms > 0 && out->dose_ms < e->p.pump_cap_ms && out->dose_ms < CFG_PUMP_CAP_MS);
+        int intents = 0;
+        for (unsigned i = 0; i < out->n_events; i++)
+            if (out->ev[i].kind == ENG_EV_WATER_INTENT && out->ev[i].durable &&
+                out->ev[i].value == (int32_t)out->dose_ms)
+                intents++;
+        CHECK(intents == 1);                                            /* one durable intent */
+    }
 }
 
 static int has_event(const struct eng_out *out, enum eng_event_kind k, int32_t v, bool durable)
@@ -114,6 +127,7 @@ static void test_bad_params_rejected(void)
     BAD("dose_ms", p.dose_ms = 0);
     BAD("dose_ms", p.dose_ms = p.pump_cap_ms);                   /* a dose must end before the cap */
     BAD("min_interval_ms", p.min_interval_ms = p.dose_ms - 1);
+    BAD("min_interval_ms", p.min_interval_ms = ENG_DAY_MS / ENG_HISTORY - 1);
     BAD("daily_dose_ms", p.daily_dose_ms = p.dose_ms - 1);
     BAD("stale_ms", p.stale_ms = 0);
 #undef BAD
@@ -220,35 +234,52 @@ static void test_rejects_malformed_samples(void)
     CHECK(e.now_ns == 4 * SEC);
 }
 
-/* Commit 1 has no rule that can request watering, so no input sequence may produce one.
+/* Random inputs: every output must be safe (check_out), and every START must have finished the
+ * dwell with no blocks and a durable intent. Stretches of good dry data alternate with random
+ * garbage so that starts really happen (checked at the end, so the START checks are not vacuous).
  * Deterministic pseudo-random inputs, so a failure is reproducible. */
-static void test_never_requests_watering_yet(void)
+static void test_random_inputs_give_safe_outputs(void)
 {
     struct eng e;
     struct eng_params p;
     struct eng_out out;
     eng_params_default(&p);
+    p.dry_dwell_ms = 60000;
+    p.warmup_ms = 10000;
     eng_init(&e, &p, 0);
 
     uint32_t x = 12345;
-    uint64_t t = SEC;
-    int starts = 0;
-    for (int i = 0; i < 20000; i++) {
+    uint64_t t = 0;
+    int starts = 0, regime_left = 0;
+    bool good = false;
+    for (int i = 0; i < 200000; i++) {
         x = x * 1103515245u + 12345u;
-        t += (x >> 8) % (2 * SEC);
-        struct record r;
-        switch ((x >> 4) % 4) {
-        case 0: r = soil((int32_t)((x >> 12) % 1024), t); break;
-        case 1: r = level((int32_t)((x >> 12) % 400), t); break;
-        case 2: r = level_no_echo(t); break;
-        default: eng_tick(&e, t, &out); check_out(&e, &out); starts += out.request == ENG_REQ_START; continue;
+        if (regime_left-- <= 0) {
+            good = (x >> 20) % 3 != 0;               /* 2/3 of stretches are good data */
+            regime_left = 30 + (int)((x >> 8) % 600);
         }
-        eng_on_sample(&e, &r, &out);
+        t += SEC / 2 + (x >> 8) % SEC;               /* 0.5 .. 1.5 s between inputs */
+        struct record r;
+        unsigned k = (x >> 4) % 3;
+        if (k == 2) {
+            eng_tick(&e, t, &out);
+        } else {
+            if (good)
+                r = k == 0 ? soil((int32_t)((x >> 12) % 30), t) : level(60 + (int32_t)((x >> 12) % 60), t);
+            else if (k == 0)
+                r = soil((int32_t)((x >> 12) % 1100) - 20, t); /* includes out-of-range values */
+            else
+                r = (x >> 14) % 4 == 0 ? level_no_echo(t) : level((int32_t)((x >> 12) % 400), t);
+            eng_on_sample(&e, &r, &out);
+        }
         check_out(&e, &out);
-        starts += out.request == ENG_REQ_START;
+        if (out.request == ENG_REQ_START) {
+            starts++;
+            e.phase = ENG_IDLE; /* white-box stand-in for commit 5: the watering is over */
+        }
     }
-    CHECK(starts == 0);
-    CHECK(eng_phase(&e) == ENG_IDLE);
+    CHECK(starts >= 5);
+    printf("    (%d start requests checked)\n", starts);
 }
 
 /* ---------------------------------------------------------------- pump-control reports */
@@ -497,7 +528,7 @@ int main(void)
     RUN(test_starts_idle_and_blocked);
     RUN(test_init_with_bad_params_is_inert);
     RUN(test_rejects_malformed_samples);
-    RUN(test_never_requests_watering_yet);
+    RUN(test_random_inputs_give_safe_outputs);
     RUN(test_unexpected_pump_start_locks_out);
     RUN(test_unexpected_stop_report);
     RUN(test_out_push_reserves_slots_for_critical_events);

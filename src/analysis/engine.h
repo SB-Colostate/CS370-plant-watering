@@ -53,8 +53,8 @@ struct eng_params {
      * the engine only guarantees it never asks for a dose that long. */
     uint32_t dose_ms;
     uint32_t pump_cap_ms;     /* <= CFG_PUMP_CAP_MS (10 min); tests may lower it */
-    uint32_t min_interval_ms; /* between the starts of two waterings */
-    uint32_t daily_dose_ms;   /* total pump-on time allowed per 24 h */
+    uint32_t min_interval_ms; /* between the starts of two waterings (>= 24 h / ENG_HISTORY) */
+    uint32_t daily_dose_ms;   /* total requested dose allowed in any 24 h window */
 
     /* Sensor health. */
     uint32_t stale_ms;  /* no REAL reading for this long: stale. Also the filters' max gap */
@@ -149,6 +149,7 @@ enum eng_request {
 
 /* Things the hub should log. Mapped to log records by the hub (commit 8, with Jim). */
 enum eng_event_kind {
+    ENG_EV_NONE = 0,         /* for eng_restore_event only: a log record that is not ours */
     ENG_EV_PHASE = 1,        /* value = new enum eng_phase */
     ENG_EV_BLOCKS = 2,       /* value = new block mask */
     ENG_EV_WATER_INTENT = 3, /* value = dose_ms; durable, must be on disk BEFORE the pump starts */
@@ -187,6 +188,23 @@ bool eng_out_push(struct eng_out *out, enum eng_event_kind kind, int32_t value, 
 
 /* ---------------------------------------------------------------- the engine */
 
+#define ENG_DAY_MS 86400000u
+/* Watering starts remembered for the rate limit and the daily cap (last 24 h). With
+ * min_interval_ms >= ENG_DAY_MS / ENG_HISTORY, live operation can never fill it. */
+#define ENG_HISTORY 32
+
+struct eng_start {
+    int64_t t_ns;     /* when it was requested, on THIS boot's monotonic clock (restored
+                       * starts from before this boot can be negative) */
+    uint32_t dose_ms; /* dose counted against the daily cap */
+};
+
+/* A start read back from the log, timed on a "continuous" clock that joins boots end to end. */
+struct eng_restored {
+    uint64_t c_ns;
+    uint32_t dose_ms;
+};
+
 /* All fields are private: read them through the accessors below. Public only so the hub can
  * keep the engine on its stack. */
 struct eng {
@@ -211,6 +229,23 @@ struct eng {
     bool warm_started, warm_done;
     uint64_t warm_start_ns;
 
+    bool soil_dry;         /* smoothed soil is dry (with hysteresis) and trustworthy */
+    uint64_t dry_since_ns; /* when the current dry stretch began (valid in ENG_DRY_DWELL) */
+
+    struct eng_start hist[ENG_HISTORY]; /* starts in the last 24 h, oldest first */
+    unsigned n_hist;
+    uint64_t capped_until_ns; /* history overflowed (corrupt log?): treat as capped until then */
+
+    /* Restore (before live input): see eng_restore_event. */
+    bool live;                /* live input has started: restore is closed */
+    bool r_have;              /* r_last is set */
+    uint64_t r_last;          /* monotonic time of the last record replayed */
+    uint64_t r_offset;        /* added to monotonic times to get the continuous clock */
+    struct eng_restored pending[ENG_HISTORY];
+    unsigned n_pending;
+    bool r_overflow;
+    uint64_t restored;        /* WATER_INTENT events accepted */
+
     uint64_t samples;            /* accepted samples */
     uint64_t rejected;           /* records that were not a valid soil/level sample */
     uint64_t unexpected_reports; /* pump-control reports that did not match our phase */
@@ -224,6 +259,21 @@ int eng_init(struct eng *e, const struct eng_params *p, uint64_t now_ns);
 /* A soil or level record, exactly as the hub stored it. Event records and malformed samples
  * are counted in `rejected` and otherwise ignored. */
 void eng_on_sample(struct eng *e, const struct record *r, struct eng_out *out);
+
+/* After a restart, the hub replays the log so that a restart (or reboot) cannot reset the rate
+ * limit or the daily cap. Call after eng_init and before any live input:
+ *   - eng_restore_event() for log records, oldest first. kind is the engine event the record
+ *     holds, or ENG_EV_NONE for any other record (samples, START...): only its time is used.
+ *     Only WATER_INTENT changes the limits. Pass every WATER_INTENT in the log, unfiltered.
+ *   - eng_restore_done() once at the end. (The first live input does it if the hub forgets.)
+ * t_ns is the record's CLOCK_MONOTONIC time, which restarts at every boot. The engine sees a
+ * reboot wherever the time goes backwards, and joins the boots end to end, counting the time
+ * between them as zero. That gives a LOWER BOUND on how long ago each start was, so a past start
+ * can only look more recent than it really was: safe, and not much more cautious than needed.
+ * The more records the hub replays (not only intents), the tighter the bound.
+ * A dose that is <= 0 or >= the pump cap is unreadable: it counts as a full pump cap. */
+void eng_restore_event(struct eng *e, enum eng_event_kind kind, int32_t value, uint64_t t_ns);
+void eng_restore_done(struct eng *e);
 
 /* Call at least once per second. Drives the time-based rules. */
 void eng_tick(struct eng *e, uint64_t now_ns, struct eng_out *out);
@@ -251,6 +301,10 @@ enum eng_phase eng_phase(const struct eng *e);
 uint32_t eng_blocks(const struct eng *e);
 enum eng_lock eng_lock_reason(const struct eng *e);
 enum eng_reservoir eng_reservoir(const struct eng *e);
+/* The DECISION that the plant needs water: soil dry for dry_dwell_ms in ENG_DRY_DWELL. It does not
+ * mean a start was requested: that also needs every block clear (sensors, reservoir, rate limit,
+ * daily cap), and the request itself is only a request. */
+bool eng_needs_water(const struct eng *e);
 
 /* Short stable names for logs and plantctl. Unknown values give "?". */
 const char *eng_phase_name(enum eng_phase ph);

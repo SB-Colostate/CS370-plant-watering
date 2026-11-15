@@ -63,6 +63,8 @@ const char *eng_params_check(const struct eng_params *p)
         return "dose_ms must be in (0, pump_cap_ms)";
     if (p->min_interval_ms < p->dose_ms)
         return "min_interval_ms must be >= dose_ms";
+    if (p->min_interval_ms < ENG_DAY_MS / ENG_HISTORY)
+        return "min_interval_ms too short: more starts per day than ENG_HISTORY can hold";
     if (p->daily_dose_ms < p->dose_ms)
         return "daily_dose_ms must allow at least one dose";
     if (p->stale_ms == 0)
@@ -209,6 +211,183 @@ int eng_init(struct eng *e, const struct eng_params *p, uint64_t now_ns)
     return 0;
 }
 
+/* ---------------------------------------------------------------- watering history */
+
+#define MS 1000000ull /* ns per ms */
+
+/* How long ago history entry i was, on this boot's clock. Never negative. */
+static uint64_t hist_age_ns(const struct eng *e, unsigned i)
+{
+    int64_t now = (int64_t)e->now_ns;
+    return now > e->hist[i].t_ns ? (uint64_t)(now - e->hist[i].t_ns) : 0;
+}
+
+static uint64_t elapsed_ns(uint64_t now, uint64_t then)
+{
+    return now > then ? now - then : 0;
+}
+
+/* Forget starts that are 24 h old or more. */
+static void history_prune(struct eng *e)
+{
+    unsigned k = 0;
+    for (unsigned i = 0; i < e->n_hist; i++)
+        if (hist_age_ns(e, i) < (uint64_t)ENG_DAY_MS * MS)
+            e->hist[k++] = e->hist[i];
+    e->n_hist = k;
+}
+
+static void history_add(struct eng *e, int64_t t_ns, uint32_t dose_ms)
+{
+    history_prune(e);
+    if (e->n_hist == ENG_HISTORY) {
+        /* Cannot happen in live operation (see eng_params_check). From a corrupt log: rather
+         * than forget a start, refuse all watering for a day. */
+        e->capped_until_ns = e->now_ns + (uint64_t)ENG_DAY_MS * MS;
+        return;
+    }
+    e->hist[e->n_hist++] = (struct eng_start){.t_ns = t_ns, .dose_ms = dose_ms};
+}
+
+static bool rate_limited(const struct eng *e)
+{
+    for (unsigned i = 0; i < e->n_hist; i++)
+        if (hist_age_ns(e, i) < (uint64_t)e->p.min_interval_ms * MS)
+            return true;
+    return false;
+}
+
+/* True if one more dose would exceed the daily cap. Call after history_prune. */
+static bool daily_capped(const struct eng *e)
+{
+    if (e->now_ns < e->capped_until_ns)
+        return true;
+    uint64_t used = 0;
+    for (unsigned i = 0; i < e->n_hist; i++)
+        used += e->hist[i].dose_ms;
+    return used + e->p.dose_ms > e->p.daily_dose_ms;
+}
+
+/* ---------------------------------------------------------------- restore */
+
+/* The continuous clock: monotonic time plus an offset that grows at every reboot (time going
+ * backwards), so that it never runs backwards itself and never runs ahead of real time. */
+static uint64_t restore_clock(struct eng *e, uint64_t t_ns)
+{
+    if (e->r_have && t_ns < e->r_last)
+        e->r_offset += e->r_last - t_ns; /* reboot: join the boots, assume no time between */
+    e->r_have = true;
+    e->r_last = t_ns;
+    return t_ns + e->r_offset;
+}
+
+void eng_restore_event(struct eng *e, enum eng_event_kind kind, int32_t value, uint64_t t_ns)
+{
+    if (!e->params_ok || e->live)
+        return;
+    uint64_t c = restore_clock(e, t_ns);
+
+    /* Already known to be 24 h old (lower bound): it no longer counts. */
+    unsigned k = 0;
+    for (unsigned i = 0; i < e->n_pending; i++)
+        if (c - e->pending[i].c_ns < (uint64_t)ENG_DAY_MS * MS)
+            e->pending[k++] = e->pending[i];
+    e->n_pending = k;
+
+    if (kind != ENG_EV_WATER_INTENT)
+        return;
+    uint32_t dose = (value <= 0 || (uint32_t)value >= e->p.pump_cap_ms)
+                        ? e->p.pump_cap_ms /* unreadable: assume the worst */
+                        : (uint32_t)value;
+    if (e->n_pending == ENG_HISTORY) {
+        e->r_overflow = true; /* more than a day can hold: corrupt log */
+        return;
+    }
+    e->pending[e->n_pending++] = (struct eng_restored){.c_ns = c, .dose_ms = dose};
+    e->restored++;
+}
+
+void eng_restore_done(struct eng *e)
+{
+    if (!e->params_ok || e->live)
+        return;
+    e->live = true;
+    /* "Now" is the next point on the continuous clock (a reboot since the last record shows
+     * up as now < r_last). Ages are lower bounds; turn them into times on this boot's clock. */
+    uint64_t c_now = e->r_have ? restore_clock(e, e->now_ns) : e->now_ns;
+    for (unsigned i = 0; i < e->n_pending; i++) {
+        uint64_t age = c_now - e->pending[i].c_ns;
+        if (age < (uint64_t)ENG_DAY_MS * MS)
+            history_add(e, (int64_t)e->now_ns - (int64_t)age, e->pending[i].dose_ms);
+    }
+    e->n_pending = 0;
+    if (e->r_overflow)
+        e->capped_until_ns = e->now_ns + (uint64_t)ENG_DAY_MS * MS;
+}
+
+/* ---------------------------------------------------------------- watering decision */
+
+bool eng_needs_water(const struct eng *e)
+{
+    return e->phase == ENG_DRY_DWELL &&
+           elapsed_ns(e->now_ns, e->dry_since_ns) >= (uint64_t)e->p.dry_dwell_ms * MS;
+}
+
+/* Our module reads LOW when dry. Dry when the smoothed value falls to soil_dry_enter; no longer
+ * dry only when it rises back to soil_dry_exit. In between, nothing changes (no flapping).
+ * If the soil reading can't be trusted (stale or at the rail), the soil is NOT dry. */
+static void update_dryness(struct eng *e)
+{
+    if (e->blocks & (ENG_BLK_SOIL_STALE | ENG_BLK_SOIL_RAIL)) {
+        e->soil_dry = false;
+        return;
+    }
+    int32_t v = soil_filter_value(&e->soil);
+    if (v <= e->p.soil_dry_enter)
+        e->soil_dry = true;
+    else if (v >= e->p.soil_dry_exit)
+        e->soil_dry = false;
+}
+
+/* The one place a start is requested. The durable intent goes first: if it can't be logged,
+ * nothing is requested. Counted against the limits at request time (refused starts count too). */
+static void request_start(struct eng *e, struct eng_out *out)
+{
+    uint32_t dose = e->p.dose_ms;
+    if (!eng_out_push(out, ENG_EV_WATER_INTENT, (int32_t)dose, true))
+        return;
+    history_add(e, (int64_t)e->now_ns, dose);
+    set_phase(e, ENG_START_REQUESTED, out);
+    out->request = ENG_REQ_START;
+    out->dose_ms = dose;
+}
+
+static void decide(struct eng *e, struct eng_out *out)
+{
+    if (!e->params_ok)
+        return;
+    update_dryness(e);
+    switch (e->phase) {
+    case ENG_IDLE:
+        if (e->soil_dry) {
+            e->dry_since_ns = e->now_ns;
+            set_phase(e, ENG_DRY_DWELL, out);
+        }
+        break;
+    case ENG_DRY_DWELL:
+        if (!e->soil_dry)
+            set_phase(e, ENG_IDLE, out); /* wet again or untrustworthy: the dwell starts over */
+        else if (eng_needs_water(e) && e->blocks == 0)
+            request_start(e, out);
+        break;
+    case ENG_START_REQUESTED:
+    case ENG_WATERING:
+    case ENG_VERIFYING:
+    case ENG_LOCKOUT:
+        break; /* commit 5 and later */
+    }
+}
+
 /* ---------------------------------------------------------------- inputs */
 
 /* Soil pinned at the top rail (shorted or wet electronics) is a probe fault. It takes
@@ -307,7 +486,12 @@ static void update_blocks(struct eng *e, struct eng_out *out)
     bool soil_fresh = soil_filter_ready(&e->soil) && e->now_ns - e->soil.newest_ns <= stale_ns;
     bool level_fresh = level_filter_ready(&e->level) && e->now_ns - e->level.newest_ns <= stale_ns;
 
-    uint32_t b = e->blocks & (ENG_BLK_RATE_LIMIT | ENG_BLK_DAILY_CAP | ENG_BLK_STAYS_WET);
+    uint32_t b = e->blocks & ENG_BLK_STAYS_WET; /* set by a later commit */
+    history_prune(e);
+    if (rate_limited(e))
+        b |= ENG_BLK_RATE_LIMIT;
+    if (daily_capped(e))
+        b |= ENG_BLK_DAILY_CAP;
     if (!soil_fresh)
         b |= ENG_BLK_SOIL_STALE;
     if (!level_fresh)
@@ -344,6 +528,7 @@ static void update_blocks(struct eng *e, struct eng_out *out)
 void eng_on_sample(struct eng *e, const struct record *r, struct eng_out *out)
 {
     out_reset(out);
+    eng_restore_done(e); /* no-op once live */
     /* An engine with invalid params never set up its filters: it ignores every sample. */
     if (e->params_ok && take_sample(e, r)) {
         e->samples++;
@@ -352,14 +537,17 @@ void eng_on_sample(struct eng *e, const struct record *r, struct eng_out *out)
         e->rejected++;
     }
     update_blocks(e, out);
+    decide(e, out);
     eng_enforce_output(e, out);
 }
 
 void eng_tick(struct eng *e, uint64_t now_ns, struct eng_out *out)
 {
     out_reset(out);
+    eng_restore_done(e); /* no-op once live */
     note_time(e, now_ns);
     update_blocks(e, out); /* a sensor that has gone quiet turns stale here */
+    decide(e, out);
     eng_enforce_output(e, out);
 }
 
