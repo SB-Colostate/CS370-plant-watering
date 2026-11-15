@@ -55,6 +55,9 @@ struct eng_params {
     uint32_t pump_cap_ms;     /* <= CFG_PUMP_CAP_MS (10 min); tests may lower it */
     uint32_t min_interval_ms; /* between the starts of two waterings (>= 24 h / ENG_HISTORY) */
     uint32_t daily_dose_ms;   /* total requested dose allowed in any 24 h window */
+    uint32_t start_confirm_ms; /* pump control must confirm a START within this */
+    uint32_t stop_grace_ms;    /* ...and a stop (dose end or STOP) within this; dose + 2 * grace
+                                * must stay below pump_cap_ms */
 
     /* Sensor health. */
     uint32_t stale_ms;  /* no REAL reading for this long: stale. Also the filters' max gap */
@@ -96,6 +99,11 @@ enum {
     ENG_BLK_STAYS_WET = 1u << 8,     /* soil has stayed wet too long (root-rot rule) */
 };
 #define ENG_BLK_ALL 0x1FFu
+/* Blocks that also STOP a watering in progress. RATE_LIMIT and DAILY_CAP are not among them:
+ * they are set by the start itself. */
+#define ENG_BLK_SAFETY                                                                     \
+    (ENG_BLK_SOIL_STALE | ENG_BLK_LEVEL_STALE | ENG_BLK_LEVEL_NO_ECHO | ENG_BLK_SOIL_RAIL | \
+     ENG_BLK_RESERVOIR_LOW)
 
 /* What the engine believes about the reservoir. Only ENG_RES_OK allows watering. */
 enum eng_reservoir {
@@ -245,6 +253,14 @@ struct eng {
     unsigned n_pending;
     bool r_overflow;
     uint64_t restored;        /* WATER_INTENT events accepted */
+
+    /* The current watering. */
+    uint64_t requested_ns;      /* START requested */
+    uint64_t started_ns;        /* pump control confirmed the start */
+    bool stop_requested;        /* we asked for STOP and it is not confirmed yet */
+    uint64_t stop_requested_ns;
+    uint32_t ran_ms;            /* as reported when the dose ended */
+    enum eng_stop stop_why;
 
     uint64_t samples;            /* accepted samples */
     uint64_t rejected;           /* records that were not a valid soil/level sample */

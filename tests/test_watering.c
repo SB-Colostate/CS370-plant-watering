@@ -144,7 +144,7 @@ static int run_until_start(int limit, int32_t soil, int32_t dist)
     return -1;
 }
 
-/* White-box stand-in for commit 5 (confirm, run, verify): the watering is over, back to IDLE. */
+/* White-box stand-in: the watering (test_pump.c) and its verification (commit 6) are over. */
 static void finish_watering(void)
 {
     E.phase = ENG_IDLE;

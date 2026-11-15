@@ -130,6 +130,9 @@ static void test_bad_params_rejected(void)
     BAD("min_interval_ms", p.min_interval_ms = ENG_DAY_MS / ENG_HISTORY - 1);
     BAD("daily_dose_ms", p.daily_dose_ms = p.dose_ms - 1);
     BAD("stale_ms", p.stale_ms = 0);
+    BAD("start_confirm_ms", p.start_confirm_ms = 0);
+    BAD("stop_grace_ms", p.stop_grace_ms = 0);
+    BAD("stop_grace_ms", p.stop_grace_ms = (p.pump_cap_ms - p.dose_ms) / 2); /* stop + give-up must fit before the cap */
 #undef BAD
 
     /* Lowering the cap for a test is allowed, as long as the dose still fits under it. */
@@ -275,7 +278,7 @@ static void test_random_inputs_give_safe_outputs(void)
         check_out(&e, &out);
         if (out.request == ENG_REQ_START) {
             starts++;
-            e.phase = ENG_IDLE; /* white-box stand-in for commit 5: the watering is over */
+            e.phase = ENG_IDLE; /* white-box: pump control is not simulated here (see test_pump.c) */
         }
     }
     CHECK(starts >= 5);
@@ -485,19 +488,27 @@ static void test_started_report_expected_only_after_request(void)
 
 static void test_stopped_report_expected_while_requested_or_watering(void)
 {
+    /* Expected in both phases (not counted as unexpected), but what it means differs.
+     * White-box: phases set directly; test_pump.c drives the same through real reports. */
     struct eng_params p;
     eng_params_default(&p);
-    enum eng_phase expected[] = {ENG_START_REQUESTED, ENG_WATERING};
-    for (size_t i = 0; i < 2; i++) {
-        struct eng e;
-        struct eng_out out;
-        eng_init(&e, &p, 0);
-        e.phase = expected[i];
-        eng_on_watering_stopped(&e, SEC, 4000, ENG_STOP_DOSE_DONE, &out);
-        check_out(&e, &out);
-        CHECK(e.unexpected_reports == 0);
-        CHECK(eng_phase(&e) != ENG_LOCKOUT);
-    }
+    struct eng e;
+    struct eng_out out;
+
+    /* WATERING: a normal end of the dose -> VERIFYING. */
+    eng_init(&e, &p, 0);
+    e.phase = ENG_WATERING;
+    eng_on_watering_stopped(&e, SEC, 4000, ENG_STOP_DOSE_DONE, &out);
+    check_out(&e, &out);
+    CHECK(e.unexpected_reports == 0 && eng_phase(&e) == ENG_VERIFYING);
+
+    /* START_REQUESTED: the pump ran but never confirmed the start -> ACTUATOR lockout. */
+    eng_init(&e, &p, 0);
+    e.phase = ENG_START_REQUESTED;
+    eng_on_watering_stopped(&e, SEC, 4000, ENG_STOP_DOSE_DONE, &out);
+    check_out(&e, &out);
+    CHECK(e.unexpected_reports == 0 && eng_phase(&e) == ENG_LOCKOUT);
+    CHECK(eng_lock_reason(&e) == ENG_LOCK_ACTUATOR && out.request == ENG_REQ_STOP);
 }
 
 /* ---------------------------------------------------------------- names */

@@ -26,6 +26,8 @@ void eng_params_default(struct eng_params *p)
     p->pump_cap_ms = CFG_PUMP_CAP_MS;
     p->min_interval_ms = CFG_ENG_MIN_INTERVAL_MS;
     p->daily_dose_ms = CFG_ENG_DAILY_DOSE_MS;
+    p->start_confirm_ms = CFG_ENG_START_CONFIRM_MS;
+    p->stop_grace_ms = CFG_ENG_STOP_GRACE_MS;
     p->stale_ms = CFG_ENG_STALE_MS;
     p->warmup_ms = CFG_ENG_WARMUP_MS;
 }
@@ -69,6 +71,11 @@ const char *eng_params_check(const struct eng_params *p)
         return "daily_dose_ms must allow at least one dose";
     if (p->stale_ms == 0)
         return "stale_ms is 0";
+    if (p->start_confirm_ms == 0)
+        return "start_confirm_ms is 0";
+    /* The engine must ask for STOP, and give up on pump control, before the cap. */
+    if (p->stop_grace_ms == 0 || (uint64_t)p->dose_ms + 2u * p->stop_grace_ms >= p->pump_cap_ms)
+        return "stop_grace_ms must be > 0 with dose_ms + 2 * stop_grace_ms < pump_cap_ms";
     return NULL;
 }
 
@@ -357,13 +364,67 @@ static void request_start(struct eng *e, struct eng_out *out)
     if (!eng_out_push(out, ENG_EV_WATER_INTENT, (int32_t)dose, true))
         return;
     history_add(e, (int64_t)e->now_ns, dose);
+    e->requested_ns = e->now_ns;
+    e->stop_requested = false;
     set_phase(e, ENG_START_REQUESTED, out);
     out->request = ENG_REQ_START;
     out->dose_ms = dose;
 }
 
+/* Ask for STOP now and on every call until pump control confirms it. */
+static void ask_stop(struct eng *e, struct eng_out *out)
+{
+    out->request = ENG_REQ_STOP;
+    out->dose_ms = 0;
+    if (!e->stop_requested) {
+        e->stop_requested = true;
+        e->stop_requested_ns = e->now_ns;
+    }
+}
+
+static void end_watering(struct eng *e)
+{
+    e->stop_requested = false;
+}
+
+/* START sent, not confirmed yet. */
+static void watch_start(struct eng *e, struct eng_out *out)
+{
+    if (e->blocks & ENG_BLK_SAFETY)
+        ask_stop(e, out); /* something went wrong before it even started: cancel */
+    if (elapsed_ns(e->now_ns, e->requested_ns) > (uint64_t)e->p.start_confirm_ms * MS)
+        enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* no answer: we don't know what the pump is doing */
+    else if (e->stop_requested)
+        out->request = ENG_REQ_STOP;
+}
+
+/* Pump confirmed running. */
+static void watch_watering(struct eng *e, struct eng_out *out)
+{
+    uint64_t on_ns = elapsed_ns(e->now_ns, e->started_ns);
+    if (on_ns >= (uint64_t)e->p.pump_cap_ms * MS) {
+        /* Backstop: unreachable with valid params (see eng_params_check), kept on purpose. */
+        enter_lockout(e, ENG_LOCK_PUMP_TIMEOUT, out);
+        return;
+    }
+    if (e->blocks & ENG_BLK_SAFETY)
+        ask_stop(e, out); /* a sensor became unreliable, or the reservoir ran low */
+    if (on_ns > ((uint64_t)e->p.dose_ms + e->p.stop_grace_ms) * MS)
+        ask_stop(e, out); /* pump control should have ended the dose by now */
+    if (e->stop_requested) {
+        out->request = ENG_REQ_STOP;
+        if (elapsed_ns(e->now_ns, e->stop_requested_ns) > (uint64_t)e->p.stop_grace_ms * MS)
+            enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* asked to stop, and it didn't */
+    }
+}
+
 static void decide(struct eng *e, struct eng_out *out)
 {
+    if (e->phase == ENG_LOCKOUT) {
+        out->request = ENG_REQ_STOP; /* on every call, for as long as it lasts */
+        out->dose_ms = 0;
+        return;
+    }
     if (!e->params_ok)
         return;
     update_dryness(e);
@@ -381,10 +442,15 @@ static void decide(struct eng *e, struct eng_out *out)
             request_start(e, out);
         break;
     case ENG_START_REQUESTED:
+        watch_start(e, out);
+        break;
     case ENG_WATERING:
+        watch_watering(e, out);
+        break;
     case ENG_VERIFYING:
+        break; /* commit 6: check the water arrived */
     case ENG_LOCKOUT:
-        break; /* commit 5 and later */
+        break; /* handled above */
     }
 }
 
@@ -556,7 +622,11 @@ void eng_on_watering_started(struct eng *e, uint64_t now_ns, struct eng_out *out
     out_reset(out);
     note_time(e, now_ns);
     if (e->phase == ENG_START_REQUESTED) {
-        /* Confirmation of our own request: ENG_WATERING, timers etc. come in commit 5. */
+        /* The confirmation of our own request: only now is the pump actually running. */
+        e->started_ns = e->now_ns;
+        set_phase(e, ENG_WATERING, out);
+        if (e->stop_requested)
+            out->request = ENG_REQ_STOP; /* we cancelled before it started: still stop */
     } else {
         /* The pump is running and we did not just ask for it (idle, already watering,
          * verifying, or locked out): stop it and wait for a person. */
@@ -571,15 +641,34 @@ void eng_on_watering_stopped(struct eng *e, uint64_t now_ns, uint32_t ran_ms, en
 {
     out_reset(out);
     note_time(e, now_ns);
-    (void)why; /* used from commit 5 */
-    if (e->phase == ENG_START_REQUESTED || e->phase == ENG_WATERING) {
-        /* Our dose ended, or pump control refused it: handled in commit 5. */
+    if (e->phase == ENG_START_REQUESTED) {
+        if (ran_ms == 0 && e->stop_requested) {
+            end_watering(e); /* our cancel, confirmed before any water moved */
+            set_phase(e, ENG_IDLE, out);
+        } else {
+            /* Refused, failed, or ran without confirming the start first. */
+            enter_lockout(e, ENG_LOCK_ACTUATOR, out);
+        }
+    } else if (e->phase == ENG_WATERING) {
+        e->ran_ms = ran_ms;
+        e->stop_why = why;
+        bool we_asked = e->stop_requested; /* read before end_watering() clears it */
+        end_watering(e);
+        if (why == ENG_STOP_CAP || ran_ms >= e->p.pump_cap_ms)
+            enter_lockout(e, ENG_LOCK_PUMP_TIMEOUT, out);
+        else if (why == ENG_STOP_ACT_FAIL || ran_ms > e->p.dose_ms + e->p.stop_grace_ms ||
+                 (why == ENG_STOP_REQUESTED && !we_asked))
+            enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* failed, overran, or the story is wrong */
+        else
+            set_phase(e, ENG_VERIFYING, out);
     } else {
         e->unexpected_reports++;
         /* A stop with ran_ms == 0 is harmless (e.g. confirming a STOP we sent while idle).
          * A stop saying the pump actually ran means water moved without our request. */
         if (ran_ms > 0)
             enter_lockout(e, ENG_LOCK_UNEXPECTED_PUMP, out);
+        else if (e->phase == ENG_LOCKOUT)
+            out->request = ENG_REQ_STOP;
     }
     eng_enforce_output(e, out);
 }

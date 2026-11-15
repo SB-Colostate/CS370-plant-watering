@@ -52,6 +52,8 @@
 #define CFG_ENG_DOSE_MS             20000   /* UNMEASURED: pump not on the bench yet */
 #define CFG_ENG_MIN_INTERVAL_MS     3600000 /* DESIGN §3: at most 1 watering per hour */
 #define CFG_ENG_DAILY_DOSE_MS       120000  /* UNMEASURED placeholder */
+#define CFG_ENG_START_CONFIRM_MS    3000    /* UNMEASURED: pump control must confirm a start */
+#define CFG_ENG_STOP_GRACE_MS       3000    /* UNMEASURED: ...and a stop */
 #define CFG_ENG_STALE_MS            5000    /* DESIGN §6 #4 target: fault noticed within 5 s */
 #define CFG_ENG_WARMUP_MS           30000   /* UNMEASURED */
 

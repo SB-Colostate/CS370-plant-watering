@@ -27,7 +27,8 @@ FILTER_OBJS = $(OBJ)/src/analysis/filters.o
 
 PROGS   = $(BIN)/plantctl $(BIN)/sampler $(BIN)/hub
 TESTS   = $(BIN)/test_smoke $(BIN)/test_record $(BIN)/test_store $(BIN)/test_parse \
-          $(BIN)/test_engine $(BIN)/test_filters $(BIN)/test_blocks $(BIN)/test_watering
+          $(BIN)/test_engine $(BIN)/test_filters $(BIN)/test_blocks $(BIN)/test_watering \
+          $(BIN)/test_pump
 HELPERS = $(BIN)/mklog
 SCRIPTS = tests/it_plantctl.sh tests/it_pipeline.sh
 
@@ -57,6 +58,7 @@ $(BIN)/test_engine: $(OBJ)/tests/test_engine.o $(ENGINE_OBJS)
 $(BIN)/test_filters: $(OBJ)/tests/test_filters.o $(FILTER_OBJS)
 $(BIN)/test_blocks: $(OBJ)/tests/test_blocks.o $(ENGINE_OBJS)
 $(BIN)/test_watering: $(OBJ)/tests/test_watering.o $(ENGINE_OBJS)
+$(BIN)/test_pump: $(OBJ)/tests/test_pump.o $(ENGINE_OBJS)
 
 test: all $(TESTS) $(HELPERS)
 	@for t in $(TESTS); do echo "== $(RUNNER) $$t"; $(RUNNER) $$t || exit 1; done
