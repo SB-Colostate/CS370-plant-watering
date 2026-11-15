@@ -27,6 +27,14 @@ static void test_median(void)
     CHECK(medwin_median(&w) == 4); /* duplicates */
 }
 
+static void test_uninitialized_window_is_safe(void)
+{
+    struct medwin w = {0}; /* size 0: e.g. an engine whose init failed */
+    medwin_push(&w, 5);
+    CHECK(w.n == 0 && !medwin_full(&w));
+    CHECK(medwin_median(&w) == 0);
+}
+
 /* ---------------------------------------------------------------- soil */
 
 static uint64_t t_soil;
@@ -244,6 +252,7 @@ static void test_level_long_outage_resets(void)
 int main(void)
 {
     RUN(test_median);
+    RUN(test_uninitialized_window_is_safe);
     RUN(test_soil_ready_and_seeded);
     RUN(test_soil_constant_is_exact);
     RUN(test_soil_single_and_double_spikes_removed);

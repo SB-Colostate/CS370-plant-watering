@@ -13,6 +13,8 @@ void medwin_init(struct medwin *w, unsigned size)
 
 void medwin_push(struct medwin *w, int32_t x)
 {
+    if (w->size == 0 || w->size > MEDWIN_MAX)
+        return; /* never initialized: refuse rather than write out of bounds */
     if (w->n == w->size) {
         memmove(&w->v[0], &w->v[1], (w->size - 1) * sizeof w->v[0]);
         w->n--;
@@ -22,11 +24,13 @@ void medwin_push(struct medwin *w, int32_t x)
 
 bool medwin_full(const struct medwin *w)
 {
-    return w->n == w->size;
+    return w->size > 0 && w->n == w->size; /* a never-initialized window is never "full" */
 }
 
 int32_t medwin_median(const struct medwin *w)
 {
+    if (w->n == 0 || w->n > MEDWIN_MAX)
+        return 0; /* callers check ready/full first; this only keeps a misuse in bounds */
     /* Insertion sort of a copy: at most 5 values. */
     int32_t s[MEDWIN_MAX];
     for (unsigned i = 0; i < w->n; i++) {
