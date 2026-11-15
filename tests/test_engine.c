@@ -104,6 +104,11 @@ static void test_bad_params_rejected(void)
     BAD("level_empty_dist_mm", p.level_empty_dist_mm = p.level_full_dist_mm);
     BAD("level_reserve_mm", p.level_reserve_mm = 0);
     BAD("level_reserve_mm", p.level_reserve_mm = p.level_empty_dist_mm - p.level_full_dist_mm);
+    BAD("level_hyst_mm", p.level_hyst_mm = -1);
+    BAD("level_hyst_mm", p.level_hyst_mm = p.level_empty_dist_mm - p.level_full_dist_mm - p.level_reserve_mm);
+    BAD("level_confirm", p.level_confirm = 0);
+    BAD("no_echo_run", p.no_echo_run = 0);
+    BAD("soil_rail_run", p.soil_rail_run = 0);
     BAD("pump_cap_ms", p.pump_cap_ms = 0);
     BAD("pump_cap_ms", p.pump_cap_ms = CFG_PUMP_CAP_MS + 1);         /* can't exceed the team's 10 min */
     BAD("dose_ms", p.dose_ms = 0);
@@ -149,7 +154,9 @@ static void test_starts_idle_and_blocked(void)
     CHECK(eng_phase(&e) == ENG_IDLE);
     CHECK(eng_lock_reason(&e) == ENG_LOCK_NONE);
     /* Nothing measured yet, so nothing is known to be safe. */
-    CHECK(eng_blocks(&e) == (ENG_BLK_SOIL_STALE | ENG_BLK_LEVEL_STALE | ENG_BLK_WARMUP));
+    CHECK(eng_blocks(&e) ==
+          (ENG_BLK_SOIL_STALE | ENG_BLK_LEVEL_STALE | ENG_BLK_RESERVOIR_LOW | ENG_BLK_WARMUP));
+    CHECK(eng_reservoir(&e) == ENG_RES_UNKNOWN);
 }
 
 static void test_init_with_bad_params_is_inert(void)
@@ -198,7 +205,7 @@ static void test_rejects_malformed_samples(void)
         CHECK(out.n_events == 0 && out.request == ENG_REQ_NONE);
     }
     CHECK(e.rejected == sizeof bad / sizeof bad[0]);
-    CHECK(e.samples == 0 && !e.have_soil && !e.have_level);
+    CHECK(e.samples == 0 && e.soil.win.n == 0 && e.level.win.n == 0 && e.level.no_echo_run == 0);
 
     struct record ok[] = {soil(0, 2 * SEC), soil(1023, 3 * SEC), level(165, 3 * SEC),
                           level_no_echo(4 * SEC)};
@@ -207,8 +214,9 @@ static void test_rejects_malformed_samples(void)
         check_out(&e, &out);
     }
     CHECK(e.samples == 4);
-    CHECK(e.have_soil && e.soil_raw == 1023 && e.soil_ns == 3 * SEC);
-    CHECK(e.have_level && e.level_no_echo && e.level_ns == 4 * SEC);
+    CHECK(e.soil.win.n == 2 && e.soil.newest_ns == 3 * SEC);
+    CHECK(e.level.win.n == 1 && e.level.no_echo_run == 1);
+    CHECK(e.level.newest_ns == 3 * SEC); /* the no-echo at 4 s did not refresh it */
     CHECK(e.now_ns == 4 * SEC);
 }
 

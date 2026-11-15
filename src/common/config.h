@@ -45,6 +45,10 @@
 #define CFG_ENG_LEVEL_EMPTY_DIST_MM 200     /* UNMEASURED placeholder: depends on the tank */
 #define CFG_ENG_LEVEL_FULL_DIST_MM  40      /* UNMEASURED; HC-SR04 is noisy under ~20 mm (DESIGN §5) */
 #define CFG_ENG_LEVEL_RESERVE_MM    20      /* UNMEASURED placeholder */
+#define CFG_ENG_LEVEL_HYST_MM       10      /* UNMEASURED placeholder */
+#define CFG_ENG_LEVEL_CONFIRM       3       /* filtered readings in a row (~3 s) to change state */
+#define CFG_ENG_NO_ECHO_RUN         3       /* no-echo readings in a row before LEVEL_NO_ECHO */
+#define CFG_ENG_SOIL_RAIL_RUN       5       /* readings in a row at the rail before SOIL_RAIL */
 #define CFG_ENG_DOSE_MS             20000   /* UNMEASURED: pump not on the bench yet */
 #define CFG_ENG_MIN_INTERVAL_MS     3600000 /* DESIGN §3: at most 1 watering per hour */
 #define CFG_ENG_DAILY_DOSE_MS       120000  /* UNMEASURED placeholder */

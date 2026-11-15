@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "analysis/filters.h"
 #include "store/record.h" /* struct record, SENSOR_*, REC_F_* (header only, nothing to link) */
 
 /* ---------------------------------------------------------------- parameters */
@@ -42,6 +43,11 @@ struct eng_params {
     int32_t level_empty_dist_mm; /* distance when the water is down at the pump inlet */
     int32_t level_full_dist_mm;  /* distance when the tank is full; must be < empty_dist */
     int32_t level_reserve_mm;    /* water height above "empty" required to start watering */
+    int32_t level_hyst_mm;       /* once low, water must reach reserve + this to count as OK */
+    uint32_t level_confirm;      /* consecutive filtered readings needed to change OK <-> LOW */
+    uint32_t no_echo_run;        /* this many no-echo readings in a row: LEVEL_NO_ECHO */
+    uint32_t soil_rail_run;      /* this many readings at the rail in a row: SOIL_RAIL (and
+                                  * this many below it to clear) */
 
     /* Watering limits. pump_cap_ms is enforced by the pump-control layer and the supervisor;
      * the engine only guarantees it never asks for a dose that long. */
@@ -51,7 +57,7 @@ struct eng_params {
     uint32_t daily_dose_ms;   /* total pump-on time allowed per 24 h */
 
     /* Sensor health. */
-    uint32_t stale_ms;  /* no sample from a sensor for this long: that sensor is stale */
+    uint32_t stale_ms;  /* no REAL reading for this long: stale. Also the filters' max gap */
     uint32_t warmup_ms; /* fresh data needed after start before the engine trusts it */
 };
 
@@ -83,13 +89,20 @@ enum {
     ENG_BLK_LEVEL_STALE = 1u << 1,   /* no recent level sample */
     ENG_BLK_LEVEL_NO_ECHO = 1u << 2, /* the ultrasonic keeps getting no echo */
     ENG_BLK_SOIL_RAIL = 1u << 3,     /* soil pinned at the top rail: probe fault */
-    ENG_BLK_RESERVOIR_LOW = 1u << 4, /* water height below level_reserve_mm */
+    ENG_BLK_RESERVOIR_LOW = 1u << 4, /* reservoir not confirmed OK: low, or not known yet */
     ENG_BLK_WARMUP = 1u << 5,        /* not enough fresh data since start */
     ENG_BLK_RATE_LIMIT = 1u << 6,    /* last watering started < min_interval_ms ago */
     ENG_BLK_DAILY_CAP = 1u << 7,     /* daily_dose_ms used up */
     ENG_BLK_STAYS_WET = 1u << 8,     /* soil has stayed wet too long (root-rot rule) */
 };
 #define ENG_BLK_ALL 0x1FFu
+
+/* What the engine believes about the reservoir. Only ENG_RES_OK allows watering. */
+enum eng_reservoir {
+    ENG_RES_UNKNOWN = 0, /* not confirmed yet (start, or level data restarted after a gap) */
+    ENG_RES_OK = 1,      /* level_confirm readings in a row at or above reserve + hyst */
+    ENG_RES_LOW = 2,     /* level_confirm readings in a row below reserve */
+};
 
 /* Result of checking one watering with both sensors. */
 enum eng_diag {
@@ -183,14 +196,20 @@ struct eng {
     enum eng_lock lock_reason;
     uint64_t now_ns; /* latest time seen from any input */
 
-    bool have_soil;
-    int32_t soil_raw;
-    uint64_t soil_ns;
+    bool params_ok;
 
-    bool have_level;
-    bool level_no_echo;
-    int32_t level_dist_mm; /* raw distance; meaningless if level_no_echo */
-    uint64_t level_ns;
+    struct soil_filter soil;
+    uint32_t soil_rail_run; /* raw readings in a row at or above soil_rail_high */
+    uint32_t soil_ok_run;   /* raw readings in a row below it */
+    bool soil_rail;
+
+    struct level_filter level;
+    enum eng_reservoir res;
+    uint32_t res_low_run, res_ok_run; /* filtered readings in a row below / above the reserve */
+    uint64_t level_resets_seen;      /* level.resets when we last looked */
+
+    bool warm_started, warm_done;
+    uint64_t warm_start_ns;
 
     uint64_t samples;            /* accepted samples */
     uint64_t rejected;           /* records that were not a valid soil/level sample */
@@ -231,6 +250,7 @@ void eng_enforce_output(struct eng *e, struct eng_out *out);
 enum eng_phase eng_phase(const struct eng *e);
 uint32_t eng_blocks(const struct eng *e);
 enum eng_lock eng_lock_reason(const struct eng *e);
+enum eng_reservoir eng_reservoir(const struct eng *e);
 
 /* Short stable names for logs and plantctl. Unknown values give "?". */
 const char *eng_phase_name(enum eng_phase ph);
@@ -238,5 +258,6 @@ const char *eng_block_name(uint32_t one_bit);
 const char *eng_diag_name(enum eng_diag d);
 const char *eng_lock_name(enum eng_lock l);
 const char *eng_request_name(enum eng_request r);
+const char *eng_reservoir_name(enum eng_reservoir r);
 
 #endif

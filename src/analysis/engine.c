@@ -18,6 +18,10 @@ void eng_params_default(struct eng_params *p)
     p->level_empty_dist_mm = CFG_ENG_LEVEL_EMPTY_DIST_MM;
     p->level_full_dist_mm = CFG_ENG_LEVEL_FULL_DIST_MM;
     p->level_reserve_mm = CFG_ENG_LEVEL_RESERVE_MM;
+    p->level_hyst_mm = CFG_ENG_LEVEL_HYST_MM;
+    p->level_confirm = CFG_ENG_LEVEL_CONFIRM;
+    p->no_echo_run = CFG_ENG_NO_ECHO_RUN;
+    p->soil_rail_run = CFG_ENG_SOIL_RAIL_RUN;
     p->dose_ms = CFG_ENG_DOSE_MS;
     p->pump_cap_ms = CFG_PUMP_CAP_MS;
     p->min_interval_ms = CFG_ENG_MIN_INTERVAL_MS;
@@ -44,6 +48,15 @@ const char *eng_params_check(const struct eng_params *p)
     if (p->level_reserve_mm <= 0 ||
         p->level_reserve_mm >= p->level_empty_dist_mm - p->level_full_dist_mm)
         return "level_reserve_mm must be in (0, empty_dist - full_dist)";
+    if (p->level_hyst_mm < 0 ||
+        p->level_reserve_mm + p->level_hyst_mm >= p->level_empty_dist_mm - p->level_full_dist_mm)
+        return "level_hyst_mm must be >= 0 and reserve + hyst below a full tank";
+    if (p->level_confirm == 0)
+        return "level_confirm is 0";
+    if (p->no_echo_run == 0)
+        return "no_echo_run is 0";
+    if (p->soil_rail_run == 0)
+        return "soil_rail_run is 0";
     if (p->pump_cap_ms == 0 || p->pump_cap_ms > CFG_PUMP_CAP_MS)
         return "pump_cap_ms must be in (0, CFG_PUMP_CAP_MS]";
     if (p->dose_ms == 0 || p->dose_ms >= p->pump_cap_ms)
@@ -184,16 +197,79 @@ int eng_init(struct eng *e, const struct eng_params *p, uint64_t now_ns)
         e->blocks = ENG_BLK_ALL;
         return -1;
     }
+    e->params_ok = true;
     e->phase = ENG_IDLE;
+    uint64_t stale_ns = (uint64_t)p->stale_ms * 1000000u;
+    soil_filter_init(&e->soil, stale_ns);
+    level_filter_init(&e->level, stale_ns);
+    e->res = ENG_RES_UNKNOWN;
     /* Nothing has been measured yet, so nothing is known to be safe. */
-    e->blocks = ENG_BLK_SOIL_STALE | ENG_BLK_LEVEL_STALE | ENG_BLK_WARMUP;
+    e->blocks = ENG_BLK_SOIL_STALE | ENG_BLK_LEVEL_STALE | ENG_BLK_RESERVOIR_LOW | ENG_BLK_WARMUP;
     e->lock_reason = ENG_LOCK_NONE;
     return 0;
 }
 
 /* ---------------------------------------------------------------- inputs */
 
-/* Records a valid sample. Returns false (caller counts it as rejected) if r is not one. */
+/* Soil pinned at the top rail (shorted or wet electronics) is a probe fault. It takes
+ * soil_rail_run readings in a row to set and the same number of normal readings to clear,
+ * so one odd reading neither raises nor hides it. */
+static void soil_rail_update(struct eng *e, int32_t raw)
+{
+    if (raw >= e->p.soil_rail_high) {
+        e->soil_rail_run++;
+        e->soil_ok_run = 0;
+    } else {
+        e->soil_ok_run++;
+        e->soil_rail_run = 0;
+    }
+    if (e->soil_rail_run >= e->p.soil_rail_run)
+        e->soil_rail = true;
+    else if (e->soil_ok_run >= e->p.soil_rail_run)
+        e->soil_rail = false;
+}
+
+/* Reservoir state from the FILTERED distance. Changing OK <-> LOW takes level_confirm filtered
+ * readings in a row; the median already removed single stray echoes, so one low reading is
+ * ignored but a tank that stays low is caught within a few seconds. */
+static void reservoir_update(struct eng *e)
+{
+    if (e->level.resets != e->level_resets_seen) {
+        /* Level data restarted after a gap: anything could have happened meanwhile. A LOW tank
+         * stays LOW; an OK tank must be confirmed again. */
+        e->level_resets_seen = e->level.resets;
+        e->res_low_run = e->res_ok_run = 0;
+        if (e->res == ENG_RES_OK)
+            e->res = ENG_RES_UNKNOWN;
+    }
+    if (!level_filter_ready(&e->level))
+        return;
+
+    int32_t dist = level_filter_dist_mm(&e->level);
+    if (dist < e->p.level_full_dist_mm) {
+        /* Closer than a full tank: a hand, a splash, or the sensor's dead zone, not water.
+         * It confirms nothing in either direction. */
+        e->res_low_run = e->res_ok_run = 0;
+        return;
+    }
+    int32_t water = eng_water_height_mm(&e->p, dist); /* larger distance -> less water */
+    if (water < e->p.level_reserve_mm) {
+        e->res_low_run++;
+        e->res_ok_run = 0;
+    } else if (water >= e->p.level_reserve_mm + e->p.level_hyst_mm) {
+        e->res_ok_run++;
+        e->res_low_run = 0;
+    } else {
+        e->res_low_run = e->res_ok_run = 0; /* in the hysteresis band: keep the current state */
+    }
+    if (e->res_low_run >= e->p.level_confirm)
+        e->res = ENG_RES_LOW;
+    else if (e->res_ok_run >= e->p.level_confirm)
+        e->res = ENG_RES_OK;
+}
+
+/* Feeds a valid sample to its filter. Returns false (caller counts it as rejected) if r is not
+ * one; a rejected record never reaches a filter, so it cannot make a sensor look alive. */
 static bool take_sample(struct eng *e, const struct record *r)
 {
     if (r->flags & REC_F_EVENT)
@@ -201,36 +277,81 @@ static bool take_sample(struct eng *e, const struct record *r)
     if (r->sensor_id == SENSOR_SOIL) {
         if (r->flags != 0 || r->value < 0 || r->value > 1023)
             return false;
-        e->have_soil = true;
-        e->soil_raw = r->value;
-        e->soil_ns = r->mono_ns;
+        soil_rail_update(e, r->value);
+        soil_filter_add(&e->soil, r->value, r->mono_ns);
         return true;
     }
     if (r->sensor_id == SENSOR_LEVEL) {
         if ((r->flags & ~REC_F_NO_ECHO) != 0)
             return false;
-        bool no_echo = (r->flags & REC_F_NO_ECHO) != 0;
-        if (!no_echo && r->value < 0)
+        if (r->flags & REC_F_NO_ECHO) {
+            level_filter_add_no_echo(&e->level); /* not a distance */
+            return true;
+        }
+        if (r->value < 0)
             return false;
-        e->have_level = true;
-        e->level_no_echo = no_echo;
-        e->level_dist_mm = no_echo ? 0 : r->value;
-        e->level_ns = r->mono_ns;
+        level_filter_add_echo(&e->level, r->value, r->mono_ns);
+        reservoir_update(e);
         return true;
     }
     return false;
 }
 
+/* Recomputes the sensor blocks from scratch at the current time. Default is blocked: each bit
+ * clears only when its sensor positively shows it is fine. */
+static void update_blocks(struct eng *e, struct eng_out *out)
+{
+    if (!e->params_ok)
+        return; /* stays ENG_BLK_ALL */
+    uint64_t stale_ns = (uint64_t)e->p.stale_ms * 1000000u;
+    bool soil_fresh = soil_filter_ready(&e->soil) && e->now_ns - e->soil.newest_ns <= stale_ns;
+    bool level_fresh = level_filter_ready(&e->level) && e->now_ns - e->level.newest_ns <= stale_ns;
+
+    uint32_t b = e->blocks & (ENG_BLK_RATE_LIMIT | ENG_BLK_DAILY_CAP | ENG_BLK_STAYS_WET);
+    if (!soil_fresh)
+        b |= ENG_BLK_SOIL_STALE;
+    if (!level_fresh)
+        b |= ENG_BLK_LEVEL_STALE;
+    if (e->level.no_echo_run >= e->p.no_echo_run)
+        b |= ENG_BLK_LEVEL_NO_ECHO;
+    if (e->soil_rail)
+        b |= ENG_BLK_SOIL_RAIL;
+    if (e->res != ENG_RES_OK)
+        b |= ENG_BLK_RESERVOIR_LOW;
+
+    /* Warm-up: both sensors fresh, without a break, for warmup_ms. Only once, after start. */
+    if (!e->warm_done) {
+        if (soil_fresh && level_fresh) {
+            if (!e->warm_started) {
+                e->warm_started = true;
+                e->warm_start_ns = e->now_ns;
+            }
+            if (e->now_ns - e->warm_start_ns >= (uint64_t)e->p.warmup_ms * 1000000u)
+                e->warm_done = true;
+        } else {
+            e->warm_started = false;
+        }
+    }
+    if (!e->warm_done)
+        b |= ENG_BLK_WARMUP;
+
+    if (b != e->blocks) {
+        e->blocks = b;
+        eng_out_push(out, ENG_EV_BLOCKS, (int32_t)b, false);
+    }
+}
+
 void eng_on_sample(struct eng *e, const struct record *r, struct eng_out *out)
 {
     out_reset(out);
-    if (take_sample(e, r)) {
+    /* An engine with invalid params never set up its filters: it ignores every sample. */
+    if (e->params_ok && take_sample(e, r)) {
         e->samples++;
         note_time(e, r->mono_ns);
-        /* Commit 1: samples are recorded but no rule acts on them yet. */
     } else {
         e->rejected++;
     }
+    update_blocks(e, out);
     eng_enforce_output(e, out);
 }
 
@@ -238,7 +359,7 @@ void eng_tick(struct eng *e, uint64_t now_ns, struct eng_out *out)
 {
     out_reset(out);
     note_time(e, now_ns);
-    /* Commit 1: no time-based rules yet. */
+    update_blocks(e, out); /* a sensor that has gone quiet turns stale here */
     eng_enforce_output(e, out);
 }
 
@@ -280,6 +401,7 @@ void eng_on_watering_stopped(struct eng *e, uint64_t now_ns, uint32_t ran_ms, en
 enum eng_phase eng_phase(const struct eng *e) { return e->phase; }
 uint32_t eng_blocks(const struct eng *e) { return e->blocks; }
 enum eng_lock eng_lock_reason(const struct eng *e) { return e->lock_reason; }
+enum eng_reservoir eng_reservoir(const struct eng *e) { return e->res; }
 
 const char *eng_phase_name(enum eng_phase ph)
 {
@@ -346,6 +468,16 @@ const char *eng_request_name(enum eng_request r)
     case ENG_REQ_NONE: return "NONE";
     case ENG_REQ_START: return "START";
     case ENG_REQ_STOP: return "STOP";
+    }
+    return "?";
+}
+
+const char *eng_reservoir_name(enum eng_reservoir r)
+{
+    switch (r) {
+    case ENG_RES_UNKNOWN: return "UNKNOWN";
+    case ENG_RES_OK: return "OK";
+    case ENG_RES_LOW: return "LOW";
     }
     return "?";
 }

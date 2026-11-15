@@ -22,12 +22,12 @@ RUNNER ?=
 
 COMMON_OBJS = $(OBJ)/src/common/paths.o
 STORE_OBJS  = $(OBJ)/src/store/record.o $(OBJ)/src/store/store.o
-ENGINE_OBJS = $(OBJ)/src/analysis/engine.o
+ENGINE_OBJS = $(OBJ)/src/analysis/engine.o $(OBJ)/src/analysis/filters.o
 FILTER_OBJS = $(OBJ)/src/analysis/filters.o
 
 PROGS   = $(BIN)/plantctl $(BIN)/sampler $(BIN)/hub
 TESTS   = $(BIN)/test_smoke $(BIN)/test_record $(BIN)/test_store $(BIN)/test_parse \
-          $(BIN)/test_engine $(BIN)/test_filters
+          $(BIN)/test_engine $(BIN)/test_filters $(BIN)/test_blocks
 HELPERS = $(BIN)/mklog
 SCRIPTS = tests/it_plantctl.sh tests/it_pipeline.sh
 
@@ -55,6 +55,7 @@ $(BIN)/hub:         $(OBJ)/src/hub/hub.o $(STORE_OBJS) $(COMMON_OBJS)
 $(BIN)/test_parse:  $(OBJ)/tests/test_parse.o $(OBJ)/src/sampler/parse.o
 $(BIN)/test_engine: $(OBJ)/tests/test_engine.o $(ENGINE_OBJS)
 $(BIN)/test_filters: $(OBJ)/tests/test_filters.o $(FILTER_OBJS)
+$(BIN)/test_blocks: $(OBJ)/tests/test_blocks.o $(ENGINE_OBJS)
 
 test: all $(TESTS) $(HELPERS)
 	@for t in $(TESTS); do echo "== $(RUNNER) $$t"; $(RUNNER) $$t || exit 1; done
