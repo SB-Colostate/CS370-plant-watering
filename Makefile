@@ -56,7 +56,8 @@ $(BIN)/mklog:       $(OBJ)/tests/mklog.o $(STORE_OBJS)
 $(BIN)/mkevents:    $(OBJ)/tests/mkevents.o $(STORE_OBJS)
 $(BIN)/plantctl:    $(OBJ)/src/plantctl/plantctl.o $(STORE_OBJS) $(COMMON_OBJS) $(ENGINE_OBJS)
 $(BIN)/sampler:     $(OBJ)/src/sampler/sampler.o $(OBJ)/src/sampler/parse.o $(COMMON_OBJS)
-$(BIN)/hub:         $(OBJ)/src/hub/hub.o $(STORE_OBJS) $(COMMON_OBJS)
+$(BIN)/hub:         $(OBJ)/src/hub/hub.o $(OBJ)/src/hub/water.o $(OBJ)/src/actuator/pump_simfile.o \
+                    $(STORE_OBJS) $(COMMON_OBJS) $(ENGINE_OBJS) $(PUMP_OBJS)
 $(BIN)/test_parse:  $(OBJ)/tests/test_parse.o $(OBJ)/src/sampler/parse.o
 $(BIN)/test_engine: $(OBJ)/tests/test_engine.o $(ENGINE_OBJS)
 $(BIN)/test_filters: $(OBJ)/tests/test_filters.o $(FILTER_OBJS)
