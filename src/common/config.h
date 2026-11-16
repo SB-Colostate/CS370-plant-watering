@@ -33,6 +33,9 @@
  * the pump-control layer and the supervisor; the engine only refuses to ask for more.
  * Never raise without both partners agreeing. Tests may lower it (in their own params). */
 #define CFG_PUMP_CAP_MS 600000
+/* Pump control turns the pump OFF by itself if it hears nothing from the hub for this long.
+ * The hub talks to it at least once a second. UNMEASURED. */
+#define CFG_PUMP_HUB_TIMEOUT_MS 5000
 
 /* Watering engine (src/analysis). PLACEHOLDERS, NOT MEASUREMENTS: each value must be replaced
  * from calibration on the real pot, probe and tank before it is trusted.

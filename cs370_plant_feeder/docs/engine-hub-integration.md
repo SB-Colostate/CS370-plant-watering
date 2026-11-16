@@ -91,6 +91,28 @@ called at all. So, separately from the engine:
 - **The supervisor** forces the pump OFF when the hub dies or hangs (DESIGN §3, §7), without asking
   the engine.
 
+## 6a. Pump control as built (`src/actuator/pump.{h,c}`, simulated backend only)
+
+Pure logic with its own rules (OFF at init and shutdown, 10-minute cap from relay-on, OFF after
+`CFG_PUMP_HUB_TIMEOUT_MS` (5 s) without word from the hub, START refused unless OFF with
+0 < dose < cap, latched FAULT if an OFF fails). The relay is switched through a backend; only
+`pump_sim.c` (SIMULATED) exists until there is hardware to test GPIO on. It does not include
+any engine header. The hub glue maps its reports onto the engine:
+
+| `pump_report` | Engine call |
+|---|---|
+| `STARTED` | `eng_on_watering_started()` |
+| `STOPPED`, `DOSE_DONE` | `eng_on_watering_stopped(..., ENG_STOP_DOSE_DONE)` |
+| `STOPPED`, `STOPPED` | `... ENG_STOP_REQUESTED` |
+| `STOPPED`, `CAP` | `... ENG_STOP_CAP` |
+| `STOPPED`, `HUB_SILENT` / `SHUTDOWN` / `SWITCH_FAILED` / `REFUSED` | `... ENG_STOP_ACT_FAIL` |
+
+The hub calls `pump_hub_alive()` on every loop pass and passes engine requests to
+`pump_start()` / `pump_stop()`. **The hub-silence cutoff only helps against a hung hub if pump
+control runs in its own process** (its own `pump_tick()` loop under the supervisor) and talks to the
+hub over a socket; inside the hub process it would hang with it. Recommended: its own process.
+`tests/test_pump_engine.c` shows the wiring end to end (with a stand-in for the hub glue).
+
 ## 7. Smaller items
 
 - `plantctl tail/status`: names for kinds 5–10, and in `status` the latest phase, blocks, lockout or
@@ -104,6 +126,6 @@ called at all. So, separately from the engine:
 1. The record kind numbers in §1.
 2. Who writes the `hub.c` changes (§2–4) and who reviews.
 3. `MSG_ACK` (§5), or another way to clear a lockout.
-4. Where pump control lives (inside the hub or as its own process under the supervisor) and its
-   "no news from the hub" timeout.
+4. Where pump control lives: its own process under the supervisor (recommended, §6a) or inside
+   the hub; and how it talks to the hub (a second socket, or extend `msg.h`).
 5. Whether replaying the whole log at startup (§2 step 4) is acceptable for now.
