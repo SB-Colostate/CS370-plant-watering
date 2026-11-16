@@ -1,11 +1,40 @@
 # Watering engine ↔ hub/storage integration (proposal, nothing changed yet)
 
-**Author:** Sam · **Status:** proposal for Jim to review · **Engine:** `src/analysis/engine.h` (branch `sam/watering-engine`)
+**Author:** Sam · **Status:** partly built on branch `sam/watering-engine`, for Jim to review before
+anything is merged · **Engine:** `src/analysis/engine.h`
 
-The watering engine is finished on its own side and tested without hardware. Wiring it in touches
-Jim's code (`src/store/record.h`, `src/hub/hub.c`, `src/plantctl/plantctl.c`, `src/common/msg.h`).
-**None of those files have been changed.** This document lists exactly what would change, so we can
-agree on it first.
+## Status (2026-11-16)
+
+Everything below runs on a PC, with a **simulated** relay and a fake Uno. Nothing has run on the Pi.
+
+**Working and tested** (`make test`; ASan + UBSan clean on x86):
+
+| What | Where | Tested by |
+|---|---|---|
+| Record kinds 5–10 (§1), named by `plantctl tail` | `record.h`, `plantctl.c` (aa66ea8) | `it_plantctl_events.sh` |
+| Hub startup order (§2): pump OFF, `store_open`, replay of the whole log, restore | `hub.c` + `hub/water.c` (bd96e69) | `it_engine.sh` |
+| Output handling (§3): events saved before the request goes on | `hub/water.c` | `it_engine.sh` scenario 1 (intent logged before relay ON) |
+| Main loop (§4): samples and ticks into the engine, pump reports back | `hub.c` + `hub/water.c` | `it_engine.sh` |
+| Full simulated cycle ending in `DIAG OK` | real sampler, hub, store | `it_engine.sh` scenario 1 |
+| Clean hub restart: history restored, no second watering | | scenario 2 |
+| `kill -9` mid-dose: restarted hub switches the relay OFF first, locks out (`UNFINISHED_WATERING`) | | scenario 3 |
+
+**Known gap, must be closed before a real pump is connected.** Pump control currently runs *inside*
+the hub (interim, marked in `water.h` and on stderr). In scenario 3 the simulated relay **stayed ON
+from the moment the hub was killed until the next hub started.** With a real pump that would keep
+water running for as long as the hub is down. Fix: pump control in its own process, under a
+supervisor (§6, §6a), plus a relay circuit that is OFF when the Pi's output is not driven (to check
+on the bench).
+
+**Not done yet:**
+- Pump control as its own process; the supervisor (mechanism E is incomplete without it).
+- Clearing a lockout: `plantctl ack` → `MSG_ACK` → `eng_acknowledge` / `eng_ack_saved` (§5).
+- GPIO relay backend (needs the pump and the Pi).
+- `plantctl status` showing the engine's phase, blocks and lockout (§7).
+- On the Pi: `make test`, `make asan` (valgrind), calibration of every `CFG_ENG_*` placeholder,
+  provoked episodes, power-pull trials, the 48 h soak.
+
+The sections below are the original proposal; §1–§4 are now built as described.
 
 ## 1. New log record types (`src/store/record.h`)
 
