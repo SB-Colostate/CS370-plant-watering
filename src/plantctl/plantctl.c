@@ -7,6 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "analysis/engine.h" /* names of the watering engine's codes, for display only */
 #include "common/exitcodes.h"
 #include "common/paths.h"
 #include "store/store.h"
@@ -25,6 +26,12 @@ static const char *event_name(unsigned kind)
     case REC_EV_RECOVERED: return "RECOVERED";
     case REC_EV_GAP: return "GAP";
     case REC_EV_SAMPLER_RESTART: return "SAMPLER_RESTART";
+    case REC_EV_WATER_INTENT: return "WATER_INTENT";
+    case REC_EV_DIAG: return "DIAG";
+    case REC_EV_LOCKOUT: return "LOCKOUT";
+    case REC_EV_ACK: return "ACK";
+    case REC_EV_PHASE: return "PHASE";
+    case REC_EV_BLOCKS: return "BLOCKS";
     default: return "EVENT?";
     }
 }
@@ -48,6 +55,12 @@ static void fmt_value(const struct record *r, char *out, size_t n)
         case REC_EV_RECOVERED: snprintf(out, n, "%s dropped=%dB", event_name(kind), r->value); break;
         case REC_EV_GAP: snprintf(out, n, "%s missed=%d", event_name(kind), r->value); break;
         case REC_EV_SAMPLER_RESTART: snprintf(out, n, "%s pid=%d", event_name(kind), r->value); break;
+        case REC_EV_WATER_INTENT: snprintf(out, n, "%s dose=%dms", event_name(kind), r->value); break;
+        case REC_EV_DIAG: snprintf(out, n, "%s %s", event_name(kind), eng_diag_name((enum eng_diag)r->value)); break;
+        case REC_EV_LOCKOUT: snprintf(out, n, "%s %s", event_name(kind), eng_lock_name((enum eng_lock)r->value)); break;
+        case REC_EV_ACK: snprintf(out, n, "%s cleared=%s", event_name(kind), eng_lock_name((enum eng_lock)r->value)); break;
+        case REC_EV_PHASE: snprintf(out, n, "%s %s", event_name(kind), eng_phase_name((enum eng_phase)r->value)); break;
+        case REC_EV_BLOCKS: snprintf(out, n, "%s 0x%02x", event_name(kind), (unsigned)r->value); break;
         default: snprintf(out, n, "%s", event_name(kind)); break;
         }
     } else if (r->sensor_id == SENSOR_LEVEL) {

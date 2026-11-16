@@ -32,8 +32,8 @@ TESTS   = $(BIN)/test_smoke $(BIN)/test_record $(BIN)/test_store $(BIN)/test_par
           $(BIN)/test_engine $(BIN)/test_filters $(BIN)/test_blocks $(BIN)/test_watering \
           $(BIN)/test_pump $(BIN)/test_verify $(BIN)/test_recovery $(BIN)/test_pumpctl \
           $(BIN)/test_pump_engine
-HELPERS = $(BIN)/mklog
-SCRIPTS = tests/it_plantctl.sh tests/it_pipeline.sh
+HELPERS = $(BIN)/mklog $(BIN)/mkevents
+SCRIPTS = tests/it_plantctl.sh tests/it_pipeline.sh tests/it_plantctl_events.sh
 
 .PHONY: all test asan clean
 
@@ -53,7 +53,8 @@ $(BIN)/test_smoke:  $(OBJ)/tests/test_smoke.o
 $(BIN)/test_record: $(OBJ)/tests/test_record.o $(STORE_OBJS)
 $(BIN)/test_store:  $(OBJ)/tests/test_store.o $(STORE_OBJS)
 $(BIN)/mklog:       $(OBJ)/tests/mklog.o $(STORE_OBJS)
-$(BIN)/plantctl:    $(OBJ)/src/plantctl/plantctl.o $(STORE_OBJS) $(COMMON_OBJS)
+$(BIN)/mkevents:    $(OBJ)/tests/mkevents.o $(STORE_OBJS)
+$(BIN)/plantctl:    $(OBJ)/src/plantctl/plantctl.o $(STORE_OBJS) $(COMMON_OBJS) $(ENGINE_OBJS)
 $(BIN)/sampler:     $(OBJ)/src/sampler/sampler.o $(OBJ)/src/sampler/parse.o $(COMMON_OBJS)
 $(BIN)/hub:         $(OBJ)/src/hub/hub.o $(STORE_OBJS) $(COMMON_OBJS)
 $(BIN)/test_parse:  $(OBJ)/tests/test_parse.o $(OBJ)/src/sampler/parse.o
