@@ -1,9 +1,13 @@
 /* Watering decision engine (owner: Sam). See engine.h for the contract.
- * Pure: the only headers used are for types and constants. No system calls in this file. */
+ * Pure: the only headers used are for types and constants. No system calls in this file.
+ * This file: parameters, output checks, lifecycle, sensor blocks, the watering decision and
+ * its phases, and the input functions. history.c: rate limit, daily cap, restore from the log.
+ * verify.c: did the water arrive. */
 #include "analysis/engine.h"
 
 #include <string.h>
 
+#include "analysis/engine_internal.h"
 #include "common/config.h"
 
 /* ---------------------------------------------------------------- parameters */
@@ -121,7 +125,7 @@ bool eng_out_push(struct eng_out *out, enum eng_event_kind kind, int32_t value, 
     return true;
 }
 
-static void out_reset(struct eng_out *out)
+void engi_out_reset(struct eng_out *out)
 {
     memset(out, 0, sizeof *out);
 }
@@ -176,7 +180,7 @@ static void note_time(struct eng *e, uint64_t t)
         e->now_ns = t;
 }
 
-static void set_phase(struct eng *e, enum eng_phase ph, struct eng_out *out)
+void engi_set_phase(struct eng *e, enum eng_phase ph, struct eng_out *out)
 {
     if (e->phase == ph)
         return;
@@ -187,7 +191,7 @@ static void set_phase(struct eng *e, enum eng_phase ph, struct eng_out *out)
 /* Latches the first reason, asks for the pump to be off, and stays there until acknowledged.
  * LOCKOUT is critical, so it always fits (reserved slots); it goes first only so the log shows
  * the reason before the phase change. */
-static void enter_lockout(struct eng *e, enum eng_lock why, struct eng_out *out)
+void engi_enter_lockout(struct eng *e, enum eng_lock why, struct eng_out *out)
 {
     out->request = ENG_REQ_STOP;
     out->dose_ms = 0;
@@ -195,7 +199,7 @@ static void enter_lockout(struct eng *e, enum eng_lock why, struct eng_out *out)
         return;
     e->lock_reason = why;
     eng_out_push(out, ENG_EV_LOCKOUT, (int32_t)why, true);
-    set_phase(e, ENG_LOCKOUT, out);
+    engi_set_phase(e, ENG_LOCKOUT, out);
 }
 
 void eng_enforce_output(struct eng *e, struct eng_out *out)
@@ -212,7 +216,7 @@ void eng_enforce_output(struct eng *e, struct eng_out *out)
     e->internal_faults++;
     /* Never pass an unsafe request on. If the engine was already locked out, enter_lockout
      * keeps the earlier reason; it still forces STOP. */
-    enter_lockout(e, ENG_LOCK_INTERNAL, out);
+    engi_enter_lockout(e, ENG_LOCK_INTERNAL, out);
 }
 
 /* ---------------------------------------------------------------- lifecycle */
@@ -240,409 +244,7 @@ int eng_init(struct eng *e, const struct eng_params *p, uint64_t now_ns)
     return 0;
 }
 
-/* ---------------------------------------------------------------- watering history */
-
-#define MS 1000000ull /* ns per ms */
-
-/* How long ago history entry i was, on this boot's clock. Never negative. */
-static uint64_t hist_age_ns(const struct eng *e, unsigned i)
-{
-    int64_t now = (int64_t)e->now_ns;
-    return now > e->hist[i].t_ns ? (uint64_t)(now - e->hist[i].t_ns) : 0;
-}
-
-static uint64_t elapsed_ns(uint64_t now, uint64_t then)
-{
-    return now > then ? now - then : 0;
-}
-
-/* Forget starts that are 24 h old or more. */
-static void history_prune(struct eng *e)
-{
-    unsigned k = 0;
-    for (unsigned i = 0; i < e->n_hist; i++)
-        if (hist_age_ns(e, i) < (uint64_t)ENG_DAY_MS * MS)
-            e->hist[k++] = e->hist[i];
-    e->n_hist = k;
-}
-
-static void history_add(struct eng *e, int64_t t_ns, uint32_t dose_ms)
-{
-    history_prune(e);
-    if (e->n_hist == ENG_HISTORY) {
-        /* Cannot happen in live operation (see eng_params_check). From a corrupt log: rather
-         * than forget a start, refuse all watering for a day. */
-        e->capped_until_ns = e->now_ns + (uint64_t)ENG_DAY_MS * MS;
-        return;
-    }
-    e->hist[e->n_hist++] = (struct eng_start){.t_ns = t_ns, .dose_ms = dose_ms};
-}
-
-static bool rate_limited(const struct eng *e)
-{
-    for (unsigned i = 0; i < e->n_hist; i++)
-        if (hist_age_ns(e, i) < (uint64_t)e->p.min_interval_ms * MS)
-            return true;
-    return false;
-}
-
-/* True if one more dose would exceed the daily cap. Call after history_prune. */
-static bool daily_capped(const struct eng *e)
-{
-    if (e->now_ns < e->capped_until_ns)
-        return true;
-    uint64_t used = 0;
-    for (unsigned i = 0; i < e->n_hist; i++)
-        used += e->hist[i].dose_ms;
-    return used + e->p.dose_ms > e->p.daily_dose_ms;
-}
-
-/* ---------------------------------------------------------------- restore */
-
-/* The continuous clock: monotonic time plus an offset that grows at every reboot (time going
- * backwards), so that it never runs backwards itself and never runs ahead of real time. */
-static uint64_t restore_clock(struct eng *e, uint64_t t_ns)
-{
-    if (e->r_have && t_ns < e->r_last)
-        e->r_offset += e->r_last - t_ns; /* reboot: join the boots, assume no time between */
-    e->r_have = true;
-    e->r_last = t_ns;
-    return t_ns + e->r_offset;
-}
-
-/* A lockout seen in the log. The first one since the last ACK keeps its reason, as live. */
-static void restore_lock(struct eng *e, enum eng_lock why)
-{
-    if (!e->r_locked) {
-        e->r_locked = true;
-        e->r_lock_reason = why;
-    }
-}
-
-static void restore_diag(struct eng *e, int32_t value)
-{
-    e->r_open = false;
-    switch (value) {
-    case ENG_DIAG_OK:
-        e->inconclusive_run = 0;
-        break;
-    case ENG_DIAG_CANCELLED:
-        break; /* no water moved: neutral */
-    case ENG_DIAG_PUMP_NO_FLOW: restore_lock(e, ENG_LOCK_PUMP_NO_FLOW); break;
-    case ENG_DIAG_LEAK_OR_PROBE_OUT: restore_lock(e, ENG_LOCK_LEAK_OR_PROBE_OUT); break;
-    case ENG_DIAG_LEVEL_NOT_TRACKING: restore_lock(e, ENG_LOCK_LEVEL_NOT_TRACKING); break;
-    default: /* INCONCLUSIVE, or a value we can't read: count it as INCONCLUSIVE */
-        e->inconclusive_run++;
-        if (e->inconclusive_run >= e->p.max_inconclusive)
-            restore_lock(e, ENG_LOCK_TOO_MANY_INCONCLUSIVE);
-        break;
-    }
-}
-
-void eng_restore_event(struct eng *e, enum eng_event_kind kind, int32_t value, uint64_t t_ns)
-{
-    if (!e->params_ok || e->live)
-        return;
-    uint64_t c = restore_clock(e, t_ns);
-
-    /* Already known to be 24 h old (lower bound): it no longer counts. */
-    unsigned k = 0;
-    for (unsigned i = 0; i < e->n_pending; i++)
-        if (c - e->pending[i].c_ns < (uint64_t)ENG_DAY_MS * MS)
-            e->pending[k++] = e->pending[i];
-    e->n_pending = k;
-
-    switch (kind) {
-    case ENG_EV_WATER_INTENT:
-        break; /* below */
-    case ENG_EV_DIAG:
-        restore_diag(e, value);
-        return;
-    case ENG_EV_LOCKOUT:
-        e->r_open = false;
-        restore_lock(e, value >= ENG_LOCK_PUMP_NO_FLOW && value <= ENG_LOCK_TOO_MANY_INCONCLUSIVE
-                            ? (enum eng_lock)value
-                            : ENG_LOCK_INTERNAL); /* unreadable reason: still locked */
-        return;
-    case ENG_EV_ACK:
-        e->r_locked = false;
-        e->r_lock_reason = ENG_LOCK_NONE;
-        e->inconclusive_run = 0;
-        return;
-    case ENG_EV_NONE:
-    case ENG_EV_PHASE:
-    case ENG_EV_BLOCKS:
-        return; /* time only */
-    }
-    if (e->r_open)
-        restore_lock(e, ENG_LOCK_UNFINISHED_WATERING); /* the previous one never finished */
-    e->r_open = true; /* closed by a later DIAG or LOCKOUT */
-    uint32_t dose = (value <= 0 || (uint32_t)value >= e->p.pump_cap_ms)
-                        ? e->p.pump_cap_ms /* unreadable: assume the worst */
-                        : (uint32_t)value;
-    if (e->n_pending == ENG_HISTORY) {
-        e->r_overflow = true; /* more than a day can hold: corrupt log */
-        return;
-    }
-    e->pending[e->n_pending++] = (struct eng_restored){.c_ns = c, .dose_ms = dose};
-    e->restored++;
-}
-
-void eng_restore_done(struct eng *e, struct eng_out *out)
-{
-    /* Public input like any other: clear the output first and check it last. (The implicit
-     * calls from the first live input pass an output that was just cleared anyway.) */
-    out_reset(out);
-    if (!e->params_ok || e->live) {
-        eng_enforce_output(e, out);
-        return;
-    }
-    e->live = true;
-    /* "Now" is the next point on the continuous clock (a reboot since the last record shows
-     * up as now < r_last). Ages are lower bounds; turn them into times on this boot's clock. */
-    uint64_t c_now = e->r_have ? restore_clock(e, e->now_ns) : e->now_ns;
-    for (unsigned i = 0; i < e->n_pending; i++) {
-        uint64_t age = c_now - e->pending[i].c_ns;
-        if (age < (uint64_t)ENG_DAY_MS * MS)
-            history_add(e, (int64_t)e->now_ns - (int64_t)age, e->pending[i].dose_ms);
-    }
-    e->n_pending = 0;
-    if (e->r_overflow)
-        e->capped_until_ns = e->now_ns + (uint64_t)ENG_DAY_MS * MS;
-
-    /* Faults survive restarts. A lockout already in the log is resumed without logging it
-     * again; an unfinished watering is a new finding and is logged. */
-    if (e->r_locked) {
-        e->phase = ENG_LOCKOUT; /* eng_enforce_output below requests STOP */
-        e->lock_reason = e->r_lock_reason;
-    } else if (e->r_open) {
-        enter_lockout(e, ENG_LOCK_UNFINISHED_WATERING, out); /* crashed or rebooted mid-watering */
-    } else if (e->inconclusive_run >= e->p.max_inconclusive) {
-        enter_lockout(e, ENG_LOCK_TOO_MANY_INCONCLUSIVE, out);
-    }
-    eng_enforce_output(e, out);
-}
-
-/* ---------------------------------------------------------------- watering decision */
-
-bool eng_needs_water(const struct eng *e)
-{
-    return e->phase == ENG_DRY_DWELL &&
-           elapsed_ns(e->now_ns, e->dry_since_ns) >= (uint64_t)e->p.dry_dwell_ms * MS;
-}
-
-/* Our module reads LOW when dry. Dry when the smoothed value falls to soil_dry_enter; no longer
- * dry only when it rises back to soil_dry_exit. In between, nothing changes (no flapping).
- * If the soil reading can't be trusted (stale or at the rail), the soil is NOT dry. */
-static void update_dryness(struct eng *e)
-{
-    if (e->blocks & (ENG_BLK_SOIL_STALE | ENG_BLK_SOIL_RAIL)) {
-        e->soil_dry = false;
-        return;
-    }
-    int32_t v = soil_filter_value(&e->soil);
-    if (v <= e->p.soil_dry_enter)
-        e->soil_dry = true;
-    else if (v >= e->p.soil_dry_exit)
-        e->soil_dry = false;
-}
-
-/* The one place a start is requested. The durable intent goes first: if it can't be logged,
- * nothing is requested. Counted against the limits at request time (refused starts count too). */
-static void request_start(struct eng *e, struct eng_out *out)
-{
-    uint32_t dose = e->p.dose_ms;
-    if (!eng_out_push(out, ENG_EV_WATER_INTENT, (int32_t)dose, true))
-        return;
-    history_add(e, (int64_t)e->now_ns, dose);
-    e->requested_ns = e->now_ns;
-    e->stop_requested = false;
-    /* "Before" for the verification: filtered values, taken while both sensors are trusted. */
-    e->soil_before = soil_filter_value(&e->soil);
-    e->soil_peak = e->soil_before;
-    e->water_before_mm = eng_water_height_mm(&e->p, level_filter_dist_mm(&e->level));
-    e->verify_data_lost = false;
-    e->verify_level_drop_mm = e->verify_soil_rise = 0;
-    set_phase(e, ENG_START_REQUESTED, out);
-    out->request = ENG_REQ_START;
-    out->dose_ms = dose;
-}
-
-/* Ask for STOP now and on every call until pump control confirms it. */
-static void ask_stop(struct eng *e, struct eng_out *out)
-{
-    out->request = ENG_REQ_STOP;
-    out->dose_ms = 0;
-    if (!e->stop_requested) {
-        e->stop_requested = true;
-        e->stop_requested_ns = e->now_ns;
-    }
-}
-
-static void end_watering(struct eng *e)
-{
-    e->stop_requested = false;
-}
-
-/* ---------------------------------------------------------------- verification */
-
-#define DATA_BLOCKS \
-    (ENG_BLK_SOIL_STALE | ENG_BLK_LEVEL_STALE | ENG_BLK_LEVEL_NO_ECHO | ENG_BLK_SOIL_RAIL)
-
-enum band { BAND_NONE, BAND_CHANGED, BAND_UNCLEAR };
-
-/* Within +-noise: no change. At least min: changed. Anything else, including a change the
- * wrong way (water level rose, soil got drier), is too unclear to call. */
-static enum band change_band(int32_t change, int32_t noise, int32_t min)
-{
-    if (change >= min)
-        return BAND_CHANGED;
-    if (change >= -noise && change <= noise)
-        return BAND_NONE;
-    return BAND_UNCLEAR;
-}
-
-enum eng_diag eng_classify(const struct eng_params *p, int32_t level_drop_mm, int32_t soil_rise)
-{
-    enum band level = change_band(level_drop_mm, p->level_noise_mm, p->level_drop_min_mm);
-    enum band soil = change_band(soil_rise, p->soil_noise, p->soil_rise_min);
-    if (level == BAND_UNCLEAR || soil == BAND_UNCLEAR)
-        return ENG_DIAG_INCONCLUSIVE;
-    if (level == BAND_CHANGED && soil == BAND_CHANGED)
-        return ENG_DIAG_OK;                 /* water left the tank and reached the soil */
-    if (level == BAND_NONE && soil == BAND_NONE)
-        return ENG_DIAG_PUMP_NO_FLOW;       /* nothing moved: pump, relay or line */
-    if (level == BAND_CHANGED)
-        return ENG_DIAG_LEAK_OR_PROBE_OUT;  /* water left, soil didn't notice */
-    return ENG_DIAG_LEVEL_NOT_TRACKING;     /* soil wetter, tank unchanged: gauge not tracking */
-}
-
-/* While watering and verifying: remember the wettest smoothed soil, and whether either sensor
- * ever stopped being trustworthy. */
-static void track_verification(struct eng *e)
-{
-    if (e->blocks & DATA_BLOCKS) {
-        e->verify_data_lost = true;
-        return;
-    }
-    int32_t v = soil_filter_value(&e->soil);
-    if (v > e->soil_peak)
-        e->soil_peak = v;
-}
-
-static void finish_verification(struct eng *e, enum eng_diag d, struct eng_out *out)
-{
-    e->last_diag = d;
-    eng_out_push(out, ENG_EV_DIAG, (int32_t)d, true);
-    switch (d) {
-    case ENG_DIAG_PUMP_NO_FLOW: enter_lockout(e, ENG_LOCK_PUMP_NO_FLOW, out); break;
-    case ENG_DIAG_LEAK_OR_PROBE_OUT: enter_lockout(e, ENG_LOCK_LEAK_OR_PROBE_OUT, out); break;
-    case ENG_DIAG_LEVEL_NOT_TRACKING: enter_lockout(e, ENG_LOCK_LEVEL_NOT_TRACKING, out); break;
-    case ENG_DIAG_OK:
-        e->inconclusive_run = 0;
-        set_phase(e, ENG_IDLE, out); /* the limits still count this watering */
-        break;
-    case ENG_DIAG_INCONCLUSIVE:
-        /* Water may have gone in without us knowing. Not forever: that is how overwatering
-         * would happen with nobody noticing. */
-        if (++e->inconclusive_run >= e->p.max_inconclusive)
-            enter_lockout(e, ENG_LOCK_TOO_MANY_INCONCLUSIVE, out);
-        else
-            set_phase(e, ENG_IDLE, out);
-        break;
-    case ENG_DIAG_NONE:
-    case ENG_DIAG_CHANNELING:
-    case ENG_DIAG_CANCELLED:
-        set_phase(e, ENG_IDLE, out);
-        break;
-    }
-}
-
-static void watch_verify(struct eng *e, struct eng_out *out)
-{
-    track_verification(e);
-    if (elapsed_ns(e->now_ns, e->verify_start_ns) < (uint64_t)e->p.verify_window_ms * MS)
-        return;
-    /* Only a full dose with trustworthy data the whole time can be judged. */
-    bool full_dose = e->stop_why == ENG_STOP_DOSE_DONE && e->ran_ms >= e->p.dose_ms;
-    if (!full_dose || e->verify_data_lost) {
-        finish_verification(e, ENG_DIAG_INCONCLUSIVE, out);
-        return;
-    }
-    int32_t water_after = eng_water_height_mm(&e->p, level_filter_dist_mm(&e->level));
-    e->verify_level_drop_mm = e->water_before_mm - water_after;
-    e->verify_soil_rise = e->soil_peak - e->soil_before;
-    finish_verification(e, eng_classify(&e->p, e->verify_level_drop_mm, e->verify_soil_rise), out);
-}
-
-/* START sent, not confirmed yet. */
-static void watch_start(struct eng *e, struct eng_out *out)
-{
-    track_verification(e);
-    if (e->blocks & ENG_BLK_SAFETY)
-        ask_stop(e, out); /* something went wrong before it even started: cancel */
-    if (elapsed_ns(e->now_ns, e->requested_ns) > (uint64_t)e->p.start_confirm_ms * MS)
-        enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* no answer: we don't know what the pump is doing */
-    else if (e->stop_requested)
-        out->request = ENG_REQ_STOP;
-}
-
-/* Pump confirmed running. */
-static void watch_watering(struct eng *e, struct eng_out *out)
-{
-    track_verification(e);
-    uint64_t on_ns = elapsed_ns(e->now_ns, e->started_ns);
-    if (on_ns >= (uint64_t)e->p.pump_cap_ms * MS) {
-        /* Backstop: unreachable with valid params (see eng_params_check), kept on purpose. */
-        enter_lockout(e, ENG_LOCK_PUMP_TIMEOUT, out);
-        return;
-    }
-    if (e->blocks & ENG_BLK_SAFETY)
-        ask_stop(e, out); /* a sensor became unreliable, or the reservoir ran low */
-    if (on_ns > ((uint64_t)e->p.dose_ms + e->p.stop_grace_ms) * MS)
-        ask_stop(e, out); /* pump control should have ended the dose by now */
-    if (e->stop_requested) {
-        out->request = ENG_REQ_STOP;
-        if (elapsed_ns(e->now_ns, e->stop_requested_ns) > (uint64_t)e->p.stop_grace_ms * MS)
-            enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* asked to stop, and it didn't */
-    }
-}
-
-static void decide(struct eng *e, struct eng_out *out)
-{
-    if (e->phase == ENG_LOCKOUT)
-        return; /* nothing to decide; eng_enforce_output requests STOP */
-    if (!e->params_ok)
-        return;
-    update_dryness(e);
-    switch (e->phase) {
-    case ENG_IDLE:
-        if (e->soil_dry) {
-            e->dry_since_ns = e->now_ns;
-            set_phase(e, ENG_DRY_DWELL, out);
-        }
-        break;
-    case ENG_DRY_DWELL:
-        if (!e->soil_dry)
-            set_phase(e, ENG_IDLE, out); /* wet again or untrustworthy: the dwell starts over */
-        else if (eng_needs_water(e) && e->blocks == 0)
-            request_start(e, out);
-        break;
-    case ENG_START_REQUESTED:
-        watch_start(e, out);
-        break;
-    case ENG_WATERING:
-        watch_watering(e, out);
-        break;
-    case ENG_VERIFYING:
-        watch_verify(e, out);
-        break;
-    case ENG_LOCKOUT:
-        break; /* handled above */
-    }
-}
-
-/* ---------------------------------------------------------------- inputs */
+/* ---------------------------------------------------------------- sensor blocks */
 
 /* Soil pinned at the top rail (shorted or wet electronics) is a probe fault. It takes
  * soil_rail_run readings in a row to set and the same number of normal readings to clear,
@@ -740,11 +342,11 @@ static void update_blocks(struct eng *e, struct eng_out *out)
     bool soil_fresh = soil_filter_ready(&e->soil) && e->now_ns - e->soil.newest_ns <= stale_ns;
     bool level_fresh = level_filter_ready(&e->level) && e->now_ns - e->level.newest_ns <= stale_ns;
 
-    uint32_t b = e->blocks & ENG_BLK_STAYS_WET; /* set by a later commit */
-    history_prune(e);
-    if (rate_limited(e))
+    uint32_t b = 0;
+    engi_history_prune(e);
+    if (engi_rate_limited(e))
         b |= ENG_BLK_RATE_LIMIT;
-    if (daily_capped(e))
+    if (engi_daily_capped(e))
         b |= ENG_BLK_DAILY_CAP;
     if (!soil_fresh)
         b |= ENG_BLK_SOIL_STALE;
@@ -779,9 +381,141 @@ static void update_blocks(struct eng *e, struct eng_out *out)
     }
 }
 
+/* ---------------------------------------------------------------- watering decision */
+
+bool eng_needs_water(const struct eng *e)
+{
+    return e->phase == ENG_DRY_DWELL &&
+           engi_elapsed_ns(e->now_ns, e->dry_since_ns) >= (uint64_t)e->p.dry_dwell_ms * MS;
+}
+
+/* Our module reads LOW when dry. Dry when the smoothed value falls to soil_dry_enter; no longer
+ * dry only when it rises back to soil_dry_exit. In between, nothing changes (no flapping).
+ * If the soil reading can't be trusted (stale or at the rail), the soil is NOT dry. */
+static void update_dryness(struct eng *e)
+{
+    if (e->blocks & (ENG_BLK_SOIL_STALE | ENG_BLK_SOIL_RAIL)) {
+        e->soil_dry = false;
+        return;
+    }
+    int32_t v = soil_filter_value(&e->soil);
+    if (v <= e->p.soil_dry_enter)
+        e->soil_dry = true;
+    else if (v >= e->p.soil_dry_exit)
+        e->soil_dry = false;
+}
+
+/* The one place a start is requested. The durable intent goes first: if it can't be logged,
+ * nothing is requested. Counted against the limits at request time (refused starts count too). */
+static void request_start(struct eng *e, struct eng_out *out)
+{
+    uint32_t dose = e->p.dose_ms;
+    if (!eng_out_push(out, ENG_EV_WATER_INTENT, (int32_t)dose, true))
+        return;
+    engi_history_add(e, (int64_t)e->now_ns, dose);
+    e->requested_ns = e->now_ns;
+    e->stop_requested = false;
+    /* "Before" for the verification: filtered values, taken while both sensors are trusted. */
+    e->soil_before = soil_filter_value(&e->soil);
+    e->soil_peak = e->soil_before;
+    e->water_before_mm = eng_water_height_mm(&e->p, level_filter_dist_mm(&e->level));
+    e->verify_data_lost = false;
+    e->verify_level_drop_mm = e->verify_soil_rise = 0;
+    engi_set_phase(e, ENG_START_REQUESTED, out);
+    out->request = ENG_REQ_START;
+    out->dose_ms = dose;
+}
+
+/* Ask for STOP now and on every call until pump control confirms it. */
+static void ask_stop(struct eng *e, struct eng_out *out)
+{
+    out->request = ENG_REQ_STOP;
+    out->dose_ms = 0;
+    if (!e->stop_requested) {
+        e->stop_requested = true;
+        e->stop_requested_ns = e->now_ns;
+    }
+}
+
+static void end_watering(struct eng *e)
+{
+    e->stop_requested = false;
+}
+
+/* ---------------------------------------------------------------- watering phases */
+
+/* START sent, not confirmed yet. */
+static void watch_start(struct eng *e, struct eng_out *out)
+{
+    engi_track_verification(e);
+    if (e->blocks & ENG_BLK_SAFETY)
+        ask_stop(e, out); /* something went wrong before it even started: cancel */
+    if (engi_elapsed_ns(e->now_ns, e->requested_ns) > (uint64_t)e->p.start_confirm_ms * MS)
+        engi_enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* no answer: we don't know what the pump is doing */
+    else if (e->stop_requested)
+        out->request = ENG_REQ_STOP;
+}
+
+/* Pump confirmed running. */
+static void watch_watering(struct eng *e, struct eng_out *out)
+{
+    engi_track_verification(e);
+    uint64_t on_ns = engi_elapsed_ns(e->now_ns, e->started_ns);
+    if (on_ns >= (uint64_t)e->p.pump_cap_ms * MS) {
+        /* Backstop: unreachable with valid params (see eng_params_check), kept on purpose. */
+        engi_enter_lockout(e, ENG_LOCK_PUMP_TIMEOUT, out);
+        return;
+    }
+    if (e->blocks & ENG_BLK_SAFETY)
+        ask_stop(e, out); /* a sensor became unreliable, or the reservoir ran low */
+    if (on_ns > ((uint64_t)e->p.dose_ms + e->p.stop_grace_ms) * MS)
+        ask_stop(e, out); /* pump control should have ended the dose by now */
+    if (e->stop_requested) {
+        out->request = ENG_REQ_STOP;
+        if (engi_elapsed_ns(e->now_ns, e->stop_requested_ns) > (uint64_t)e->p.stop_grace_ms * MS)
+            engi_enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* asked to stop, and it didn't */
+    }
+}
+
+static void decide(struct eng *e, struct eng_out *out)
+{
+    if (e->phase == ENG_LOCKOUT)
+        return; /* nothing to decide; eng_enforce_output requests STOP */
+    if (!e->params_ok)
+        return;
+    update_dryness(e);
+    switch (e->phase) {
+    case ENG_IDLE:
+        if (e->soil_dry) {
+            e->dry_since_ns = e->now_ns;
+            engi_set_phase(e, ENG_DRY_DWELL, out);
+        }
+        break;
+    case ENG_DRY_DWELL:
+        if (!e->soil_dry)
+            engi_set_phase(e, ENG_IDLE, out); /* wet again or untrustworthy: the dwell starts over */
+        else if (eng_needs_water(e) && e->blocks == 0)
+            request_start(e, out);
+        break;
+    case ENG_START_REQUESTED:
+        watch_start(e, out);
+        break;
+    case ENG_WATERING:
+        watch_watering(e, out);
+        break;
+    case ENG_VERIFYING:
+        engi_watch_verify(e, out);
+        break;
+    case ENG_LOCKOUT:
+        break; /* handled above */
+    }
+}
+
+/* ---------------------------------------------------------------- inputs */
+
 void eng_on_sample(struct eng *e, const struct record *r, struct eng_out *out)
 {
-    out_reset(out);
+    engi_out_reset(out);
     eng_restore_done(e, out); /* no-op once live */
     /* An engine with invalid params never set up its filters: it ignores every sample. */
     if (e->params_ok && take_sample(e, r)) {
@@ -797,7 +531,7 @@ void eng_on_sample(struct eng *e, const struct record *r, struct eng_out *out)
 
 void eng_tick(struct eng *e, uint64_t now_ns, struct eng_out *out)
 {
-    out_reset(out);
+    engi_out_reset(out);
     eng_restore_done(e, out); /* no-op once live */
     note_time(e, now_ns);
     update_blocks(e, out); /* a sensor that has gone quiet turns stale here */
@@ -807,19 +541,19 @@ void eng_tick(struct eng *e, uint64_t now_ns, struct eng_out *out)
 
 void eng_on_watering_started(struct eng *e, uint64_t now_ns, struct eng_out *out)
 {
-    out_reset(out);
+    engi_out_reset(out);
     note_time(e, now_ns);
     if (e->phase == ENG_START_REQUESTED) {
         /* The confirmation of our own request: only now is the pump actually running. */
         e->started_ns = e->now_ns;
-        set_phase(e, ENG_WATERING, out);
+        engi_set_phase(e, ENG_WATERING, out);
         if (e->stop_requested)
             out->request = ENG_REQ_STOP; /* we cancelled before it started: still stop */
     } else {
         /* The pump is running and we did not just ask for it (idle, already watering,
          * verifying, or locked out): stop it and wait for a person. */
         e->unexpected_reports++;
-        enter_lockout(e, ENG_LOCK_UNEXPECTED_PUMP, out);
+        engi_enter_lockout(e, ENG_LOCK_UNEXPECTED_PUMP, out);
     }
     eng_enforce_output(e, out);
 }
@@ -827,17 +561,17 @@ void eng_on_watering_started(struct eng *e, uint64_t now_ns, struct eng_out *out
 void eng_on_watering_stopped(struct eng *e, uint64_t now_ns, uint32_t ran_ms, enum eng_stop why,
                              struct eng_out *out)
 {
-    out_reset(out);
+    engi_out_reset(out);
     note_time(e, now_ns);
     if (e->phase == ENG_START_REQUESTED) {
         if (ran_ms == 0 && e->stop_requested) {
             end_watering(e); /* our cancel, confirmed before any water moved */
             e->last_diag = ENG_DIAG_CANCELLED;
             eng_out_push(out, ENG_EV_DIAG, ENG_DIAG_CANCELLED, true); /* closes the attempt */
-            set_phase(e, ENG_IDLE, out);
+            engi_set_phase(e, ENG_IDLE, out);
         } else {
             /* Refused, failed, or ran without confirming the start first. */
-            enter_lockout(e, ENG_LOCK_ACTUATOR, out);
+            engi_enter_lockout(e, ENG_LOCK_ACTUATOR, out);
         }
     } else if (e->phase == ENG_WATERING) {
         e->ran_ms = ran_ms;
@@ -845,27 +579,27 @@ void eng_on_watering_stopped(struct eng *e, uint64_t now_ns, uint32_t ran_ms, en
         bool we_asked = e->stop_requested; /* read before end_watering() clears it */
         end_watering(e);
         if (why == ENG_STOP_CAP || ran_ms >= e->p.pump_cap_ms)
-            enter_lockout(e, ENG_LOCK_PUMP_TIMEOUT, out);
+            engi_enter_lockout(e, ENG_LOCK_PUMP_TIMEOUT, out);
         else if (why == ENG_STOP_ACT_FAIL || ran_ms > e->p.dose_ms + e->p.stop_grace_ms ||
                  (why == ENG_STOP_REQUESTED && !we_asked))
-            enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* failed, overran, or the story is wrong */
+            engi_enter_lockout(e, ENG_LOCK_ACTUATOR, out); /* failed, overran, or the story is wrong */
         else {
             e->verify_start_ns = e->now_ns;
-            set_phase(e, ENG_VERIFYING, out);
+            engi_set_phase(e, ENG_VERIFYING, out);
         }
     } else {
         e->unexpected_reports++;
         /* A stop with ran_ms == 0 is harmless (e.g. confirming a STOP we sent while idle).
          * A stop saying the pump actually ran means water moved without our request. */
         if (ran_ms > 0)
-            enter_lockout(e, ENG_LOCK_UNEXPECTED_PUMP, out);
+            engi_enter_lockout(e, ENG_LOCK_UNEXPECTED_PUMP, out);
     }
     eng_enforce_output(e, out);
 }
 
 void eng_acknowledge(struct eng *e, uint64_t now_ns, struct eng_out *out)
 {
-    out_reset(out);
+    engi_out_reset(out);
     note_time(e, now_ns);
     eng_restore_done(e, out); /* acknowledging what the log says, not a blank engine */
     if (e->params_ok && e->phase == ENG_LOCKOUT) {
@@ -879,14 +613,14 @@ void eng_acknowledge(struct eng *e, uint64_t now_ns, struct eng_out *out)
 
 void eng_ack_saved(struct eng *e, uint64_t now_ns, struct eng_out *out)
 {
-    out_reset(out);
+    engi_out_reset(out);
     note_time(e, now_ns);
     if (e->params_ok && e->phase == ENG_LOCKOUT && e->ack_pending) {
         e->ack_pending = false;
         e->lock_reason = ENG_LOCK_NONE;
         e->inconclusive_run = 0;
         end_watering(e);
-        set_phase(e, ENG_IDLE, out);
+        engi_set_phase(e, ENG_IDLE, out);
         /* History (rate limit, daily cap) is deliberately kept. */
     }
     eng_enforce_output(e, out);
@@ -924,7 +658,6 @@ const char *eng_block_name(uint32_t one_bit)
     case ENG_BLK_WARMUP: return "WARMUP";
     case ENG_BLK_RATE_LIMIT: return "RATE_LIMIT";
     case ENG_BLK_DAILY_CAP: return "DAILY_CAP";
-    case ENG_BLK_STAYS_WET: return "STAYS_WET";
     }
     return "?";
 }

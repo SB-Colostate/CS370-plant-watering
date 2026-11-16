@@ -21,9 +21,9 @@
  * argument, in CLOCK_MONOTONIC nanoseconds (the clock the sampler stamps every sample with), so
  * every behavior can be tested without hardware and without sleeping.
  *
- * Commit 1 status: types, parameters, and a safe-by-default skeleton. The engine starts IDLE
- * with the "no data yet" blocks set and never requests watering. Later commits add filtering,
- * the blocks, dry detection, watering, verification, and restore from the log.
+ * Code: engine.c (parameters, output checks, sensor blocks, the decision and its phases, inputs),
+ * history.c (rate limit, daily cap, restore from the log), verify.c (did the water arrive),
+ * filters.c (median and smoothing). How the hub uses it: docs/engine-hub-integration.md.
  */
 #ifndef PLANT_ENGINE_H
 #define PLANT_ENGINE_H
@@ -101,8 +101,8 @@ enum eng_phase {
     ENG_LOCKOUT = 5,         /* a fault that needs a person; no watering until acknowledged */
 };
 
-/* Why watering is not allowed right now. Any bit set blocks a start (and, from commit 5,
- * stops a dose in progress). These clear by themselves when the condition goes away. */
+/* Why watering is not allowed right now. Any bit set blocks a start; the ENG_BLK_SAFETY ones also
+ * stop a dose in progress. These clear by themselves when the condition goes away. */
 enum {
     ENG_BLK_SOIL_STALE = 1u << 0,    /* no recent soil sample */
     ENG_BLK_LEVEL_STALE = 1u << 1,   /* no recent level sample */
@@ -112,9 +112,8 @@ enum {
     ENG_BLK_WARMUP = 1u << 5,        /* not enough fresh data since start */
     ENG_BLK_RATE_LIMIT = 1u << 6,    /* last watering started < min_interval_ms ago */
     ENG_BLK_DAILY_CAP = 1u << 7,     /* daily_dose_ms used up */
-    ENG_BLK_STAYS_WET = 1u << 8,     /* soil has stayed wet too long (root-rot rule) */
 };
-#define ENG_BLK_ALL 0x1FFu
+#define ENG_BLK_ALL 0xFFu
 /* Blocks that also STOP a watering in progress. RATE_LIMIT and DAILY_CAP are not among them:
  * they are set by the start itself. */
 #define ENG_BLK_SAFETY                                                                     \
@@ -173,7 +172,8 @@ enum eng_request {
     ENG_REQ_STOP = 2,  /* please make sure the pump is off, now */
 };
 
-/* Things the hub should log. Mapped to log records by the hub (commit 8, with Jim). */
+/* Things the hub should log, as records of the matching REC_EV_* kind (see
+ * docs/engine-hub-integration.md; not added to record.h yet). */
 enum eng_event_kind {
     ENG_EV_NONE = 0,         /* for eng_restore_event only: a log record that is not ours */
     ENG_EV_PHASE = 1,        /* value = new enum eng_phase */

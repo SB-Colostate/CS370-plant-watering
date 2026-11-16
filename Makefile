@@ -22,7 +22,8 @@ RUNNER ?=
 
 COMMON_OBJS = $(OBJ)/src/common/paths.o
 STORE_OBJS  = $(OBJ)/src/store/record.o $(OBJ)/src/store/store.o
-ENGINE_OBJS = $(OBJ)/src/analysis/engine.o $(OBJ)/src/analysis/filters.o
+ENGINE_OBJS = $(OBJ)/src/analysis/engine.o $(OBJ)/src/analysis/history.o \
+              $(OBJ)/src/analysis/verify.o $(OBJ)/src/analysis/filters.o
 FILTER_OBJS = $(OBJ)/src/analysis/filters.o
 
 PROGS   = $(BIN)/plantctl $(BIN)/sampler $(BIN)/hub
