@@ -1,5 +1,6 @@
 /* hub: receives sampler datagrams and appends them to the log (mechanism D).
- * Recovery runs in store_open at startup; fsync follows the store's batch policy. */
+ * Recovery runs in store_open at startup; fsync follows the store's batch policy.
+ * The watering engine and (for now, SIMULATED) pump control are attached through water.h. */
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -16,6 +17,7 @@
 #include "common/exitcodes.h"
 #include "common/msg.h"
 #include "common/paths.h"
+#include "hub/water.h"
 #include "store/store.h"
 
 static volatile sig_atomic_t stop;
@@ -81,11 +83,12 @@ static int bind_socket(const char *path)
 int main(int argc, char **argv)
 {
     char dir[PATH_MAX] = "", sock_path[PATH_MAX];
-    int opt;
-    while ((opt = getopt(argc, argv, "d:")) != -1) {
+    int opt, test_timings = 0;
+    while ((opt = getopt(argc, argv, "d:t")) != -1) {
         switch (opt) {
         case 'd': snprintf(dir, sizeof dir, "%s", optarg); break;
-        default: fprintf(stderr, "usage: hub [-d datadir]\n"); return EXIT_USAGE;
+        case 't': test_timings = 1; break; /* short engine timings, for tests only */
+        default: fprintf(stderr, "usage: hub [-d datadir] [-t]\n"); return EXIT_USAGE;
         }
     }
     if (!dir[0] && default_data_dir(dir, sizeof dir) < 0) {
@@ -99,17 +102,31 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 
-    struct store s = {0};
-    struct store_recovery rec;
-    int rc = store_open(&s, dir, &rec);
+    struct water w = {0};
+    int rc = water_pump_off(&w, dir); /* first: a crashed hub may have left the pump on */
     if (rc != 0)
         return rc;
+
+    struct store s = {0};
+    struct store_recovery rec;
+    rc = store_open(&s, dir, &rec);
+    if (rc != 0) {
+        water_close(&w);
+        return rc;
+    }
     fprintf(stderr, "hub: log %s/%s: %u valid records, dropped %llu bytes%s; next seq %u\n", dir,
             CFG_LOG_FILE, rec.records, (unsigned long long)rec.dropped_bytes,
             rec.created ? " (new file)" : "", s.next_seq);
 
+    if ((rc = water_open(&w, &s, dir, test_timings)) != 0) {
+        water_close(&w);
+        store_close(&s);
+        return rc;
+    }
+
     int sock = bind_socket(sock_path);
     if (sock < 0) {
+        water_close(&w);
         store_close(&s);
         return EXIT_SYSERR;
     }
@@ -164,11 +181,18 @@ int main(int argc, char **argv)
             };
             if ((rc = store_append(&s, &r, 0)) != EXIT_OK)
                 break;
+            if ((rc = water_on_sample(&w, &r)) != EXIT_OK)
+                break;
         }
+        if (rc == EXIT_OK)
+            rc = water_tick(&w);
         if (rc == EXIT_OK)
             rc = store_maybe_sync(&s);
     }
 
+    int wrc = water_close(&w);
+    if (rc == EXIT_OK)
+        rc = wrc;
     int crc = store_close(&s);
     close(sock);
     unlink(sock_path);
