@@ -22,11 +22,18 @@ RUNNER ?=
 
 COMMON_OBJS = $(OBJ)/src/common/paths.o
 STORE_OBJS  = $(OBJ)/src/store/record.o $(OBJ)/src/store/store.o
+ENGINE_OBJS = $(OBJ)/src/analysis/engine.o $(OBJ)/src/analysis/history.o \
+              $(OBJ)/src/analysis/verify.o $(OBJ)/src/analysis/filters.o
+PUMP_OBJS   = $(OBJ)/src/actuator/pump.o $(OBJ)/src/actuator/pump_sim.o
+FILTER_OBJS = $(OBJ)/src/analysis/filters.o
 
 PROGS   = $(BIN)/plantctl $(BIN)/sampler $(BIN)/hub
-TESTS   = $(BIN)/test_smoke $(BIN)/test_record $(BIN)/test_store $(BIN)/test_parse
-HELPERS = $(BIN)/mklog
-SCRIPTS = tests/it_plantctl.sh tests/it_pipeline.sh
+TESTS   = $(BIN)/test_smoke $(BIN)/test_record $(BIN)/test_store $(BIN)/test_parse \
+          $(BIN)/test_engine $(BIN)/test_filters $(BIN)/test_blocks $(BIN)/test_watering \
+          $(BIN)/test_pump $(BIN)/test_verify $(BIN)/test_recovery $(BIN)/test_pumpctl \
+          $(BIN)/test_pump_engine
+HELPERS = $(BIN)/mklog $(BIN)/mkevents $(BIN)/fakeuno
+SCRIPTS = tests/it_plantctl.sh tests/it_pipeline.sh tests/it_plantctl_events.sh tests/it_engine.sh
 
 .PHONY: all test asan clean
 
@@ -46,10 +53,22 @@ $(BIN)/test_smoke:  $(OBJ)/tests/test_smoke.o
 $(BIN)/test_record: $(OBJ)/tests/test_record.o $(STORE_OBJS)
 $(BIN)/test_store:  $(OBJ)/tests/test_store.o $(STORE_OBJS)
 $(BIN)/mklog:       $(OBJ)/tests/mklog.o $(STORE_OBJS)
-$(BIN)/plantctl:    $(OBJ)/src/plantctl/plantctl.o $(STORE_OBJS) $(COMMON_OBJS)
+$(BIN)/mkevents:    $(OBJ)/tests/mkevents.o $(STORE_OBJS)
+$(BIN)/fakeuno:     $(OBJ)/tests/fakeuno.o
+$(BIN)/plantctl:    $(OBJ)/src/plantctl/plantctl.o $(STORE_OBJS) $(COMMON_OBJS) $(ENGINE_OBJS)
 $(BIN)/sampler:     $(OBJ)/src/sampler/sampler.o $(OBJ)/src/sampler/parse.o $(COMMON_OBJS)
-$(BIN)/hub:         $(OBJ)/src/hub/hub.o $(STORE_OBJS) $(COMMON_OBJS)
+$(BIN)/hub:         $(OBJ)/src/hub/hub.o $(OBJ)/src/hub/water.o $(OBJ)/src/actuator/pump_simfile.o \
+                    $(STORE_OBJS) $(COMMON_OBJS) $(ENGINE_OBJS) $(PUMP_OBJS)
 $(BIN)/test_parse:  $(OBJ)/tests/test_parse.o $(OBJ)/src/sampler/parse.o
+$(BIN)/test_engine: $(OBJ)/tests/test_engine.o $(ENGINE_OBJS)
+$(BIN)/test_filters: $(OBJ)/tests/test_filters.o $(FILTER_OBJS)
+$(BIN)/test_blocks: $(OBJ)/tests/test_blocks.o $(ENGINE_OBJS)
+$(BIN)/test_watering: $(OBJ)/tests/test_watering.o $(ENGINE_OBJS)
+$(BIN)/test_pump: $(OBJ)/tests/test_pump.o $(ENGINE_OBJS)
+$(BIN)/test_verify: $(OBJ)/tests/test_verify.o $(ENGINE_OBJS)
+$(BIN)/test_recovery: $(OBJ)/tests/test_recovery.o $(ENGINE_OBJS)
+$(BIN)/test_pumpctl: $(OBJ)/tests/test_pumpctl.o $(PUMP_OBJS)
+$(BIN)/test_pump_engine: $(OBJ)/tests/test_pump_engine.o $(ENGINE_OBJS) $(PUMP_OBJS)
 
 test: all $(TESTS) $(HELPERS)
 	@for t in $(TESTS); do echo "== $(RUNNER) $$t"; $(RUNNER) $$t || exit 1; done

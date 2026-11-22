@@ -29,7 +29,16 @@ enum {
     REC_EV_RECOVERED = 2,       /* recovery truncated a torn tail; value = bytes dropped */
     REC_EV_GAP = 3,             /* sampler datagrams missing; value = count missed */
     REC_EV_SAMPLER_RESTART = 4, /* new sampler pid seen; value = new pid */
+    /* Watering engine events (src/analysis/engine.h, ENG_EV_*). value as documented there. */
+    REC_EV_WATER_INTENT = 5,    /* value = dose ms; durable, before the pump may start */
+    REC_EV_DIAG = 6,            /* value = enum eng_diag; durable */
+    REC_EV_LOCKOUT = 7,         /* value = enum eng_lock; durable */
+    REC_EV_ACK = 8,             /* value = the lock reason cleared; durable */
+    REC_EV_PHASE = 9,           /* value = enum eng_phase */
+    REC_EV_BLOCKS = 10,         /* value = engine block bitmask */
 };
+/* The kind is stored in the top 4 bits of flags. */
+_Static_assert(REC_EV_BLOCKS <= 15, "event kinds must fit in 4 bits");
 
 #define REC_EVENT_FLAGS(kind) ((uint8_t)(REC_F_EVENT | ((unsigned)(kind) << 4)))
 #define REC_EVENT_KIND(flags) ((unsigned)(flags) >> 4)

@@ -29,4 +29,41 @@
 #define CFG_STATUS_PERIOD_MS     60000  /* heartbeat line with RSS to plant.log */
 #define CFG_STOP_GRACE_MS        3000   /* SIGTERM -> SIGKILL */
 
+/* Pump safety (CLAUDE.md hard constraint): no single pump run may exceed 10 minutes. Enforced by
+ * the pump-control layer and the supervisor; the engine only refuses to ask for more.
+ * Never raise without both partners agreeing. Tests may lower it (in their own params). */
+#define CFG_PUMP_CAP_MS 600000
+/* Pump control turns the pump OFF by itself if it hears nothing from the hub for this long.
+ * The hub talks to it at least once a second. UNMEASURED. */
+#define CFG_PUMP_HUB_TIMEOUT_MS 5000
+
+/* Watering engine (src/analysis). PLACEHOLDERS, NOT MEASUREMENTS: each value must be replaced
+ * from calibration on the real pot, probe and tank before it is trusted.
+ * Soil is raw ADC counts; our module reads ~0 dry and rises when wet.
+ * Level is the HC-SR04 DISTANCE to the water in mm: larger distance = less water. */
+#define CFG_ENG_SOIL_DRY_ENTER      40      /* UNMEASURED placeholder */
+#define CFG_ENG_SOIL_DRY_EXIT       80      /* UNMEASURED placeholder */
+#define CFG_ENG_SOIL_RAIL_HIGH      1023    /* ADC full scale */
+#define CFG_ENG_DRY_DWELL_MS        600000  /* 10 min; UNMEASURED */
+#define CFG_ENG_LEVEL_EMPTY_DIST_MM 200     /* UNMEASURED placeholder: depends on the tank */
+#define CFG_ENG_LEVEL_FULL_DIST_MM  40      /* UNMEASURED; HC-SR04 is noisy under ~20 mm (DESIGN §5) */
+#define CFG_ENG_LEVEL_RESERVE_MM    20      /* UNMEASURED placeholder */
+#define CFG_ENG_LEVEL_HYST_MM       10      /* UNMEASURED placeholder */
+#define CFG_ENG_LEVEL_CONFIRM       3       /* filtered readings in a row (~3 s) to change state */
+#define CFG_ENG_NO_ECHO_RUN         3       /* no-echo readings in a row before LEVEL_NO_ECHO */
+#define CFG_ENG_SOIL_RAIL_RUN       5       /* readings in a row at the rail before SOIL_RAIL */
+#define CFG_ENG_DOSE_MS             20000   /* UNMEASURED: pump not on the bench yet */
+#define CFG_ENG_MIN_INTERVAL_MS     3600000 /* DESIGN §3: at most 1 watering per hour */
+#define CFG_ENG_DAILY_DOSE_MS       120000  /* UNMEASURED placeholder */
+#define CFG_ENG_START_CONFIRM_MS    3000    /* UNMEASURED: pump control must confirm a start */
+#define CFG_ENG_STOP_GRACE_MS       3000    /* UNMEASURED: ...and a stop */
+#define CFG_ENG_VERIFY_WINDOW_MS    600000  /* 10 min for the soil to respond; UNMEASURED */
+#define CFG_ENG_LEVEL_NOISE_MM      5       /* M3 resting readings varied ~6 mm (16.2-16.8 cm); UNMEASURED */
+#define CFG_ENG_LEVEL_DROP_MIN_MM   10      /* UNMEASURED: depends on tank area and dose */
+#define CFG_ENG_SOIL_NOISE          10      /* UNMEASURED placeholder */
+#define CFG_ENG_SOIL_RISE_MIN       30      /* UNMEASURED placeholder */
+#define CFG_ENG_MAX_INCONCLUSIVE    3       /* INCONCLUSIVE results in a row before lockout; placeholder */
+#define CFG_ENG_STALE_MS            5000    /* DESIGN §6 #4 target: fault noticed within 5 s */
+#define CFG_ENG_WARMUP_MS           30000   /* UNMEASURED */
+
 #endif
